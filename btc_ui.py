@@ -1,25 +1,36 @@
 import subprocess
 import sys
 import os
+import json
+import streamlit as st
+import plotly.graph_objects as go
 
+# =========================
+# AUTO-START ENGINE (SAFE)
+# =========================
 ENGINE_FLAG = "/tmp/engine_started.flag"
 
 if not os.path.exists(ENGINE_FLAG):
     subprocess.Popen([sys.executable, "btc_telegram_alerts.py"])
     open(ENGINE_FLAG, "w").close()
 
-import json
-import os
-import streamlit as st
-import plotly.graph_objects as go
-
+# =========================
+# CONFIG
+# =========================
 STATE_FILE = "btc_state.json"  # must match engine
 
+# =========================
+# STREAMLIT SETUP
+# =========================
 st.set_page_config(page_title="BTC AI Dashboard", layout="wide")
+st.autorefresh(interval=5000, key="btc_refresh")  # 🔄 auto update every 5s
+
 st.title("🧠 BTC AI Dashboard")
 st.caption("Short-term • AI-filtered • Telegram alerts")
 
-
+# =========================
+# HELPERS
+# =========================
 def safe_load_state():
     if not os.path.exists(STATE_FILE):
         return None
@@ -49,32 +60,48 @@ def render_candles(candles):
             )
         ]
     )
+
     fig.update_layout(
         height=320,
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
         margin=dict(l=10, r=10, t=10, b=10),
     )
+
     st.plotly_chart(fig, width="stretch")
 
 
+# =========================
+# LOAD STATE
+# =========================
 state = safe_load_state()
+
 if not state:
-    st.info("⏳ Waiting for engine data… (start btc_telegram_alerts.py first)")
+    st.info("⏳ Waiting for engine data…")
     st.stop()
 
-if "error" in state and state["error"]:
+if state.get("error"):
     st.error(f"Engine error: {state['error']}")
 
+# =========================
+# METRICS
+# =========================
 c1, c2, c3, c4 = st.columns(4)
+
 c1.metric("BTC Price", f"${state.get('price', 0):,.2f}")
 c2.metric("RSI (1m)", state.get("rsi", 0))
 c3.metric("Trend", state.get("trend", "WAIT"))
 c4.metric("🧠 Confidence", f"{state.get('confidence', 0)}%")
 
-st.caption(f"Last update: {state.get('time','--:--:--')}  •  {state.get('notes','')}")
+st.caption(
+    f"Last update: {state.get('time','--:--:--')}  •  {state.get('notes','')}"
+)
 
+# =========================
+# SIGNAL QUALITY
+# =========================
 conf = state.get("confidence", 0)
+
 if conf >= 75:
     st.success("🔥 High-quality setup")
 elif conf >= 60:
@@ -82,8 +109,14 @@ elif conf >= 60:
 else:
     st.info("⏳ Waiting for stronger conditions")
 
+# =========================
+# CHART
+# =========================
 st.subheader("📊 BTC 1-Minute Candlesticks (Last 30 min)")
 render_candles(state.get("candles", []))
 
+# =========================
+# MANUAL REFRESH (OPTIONAL)
+# =========================
 if st.button("🔄 Refresh Now"):
     st.rerun()
