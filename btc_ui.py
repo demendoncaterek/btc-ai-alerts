@@ -1,3 +1,13 @@
+import subprocess
+import sys
+import os
+
+ENGINE_FLAG = "/tmp/engine_started.flag"
+
+if not os.path.exists(ENGINE_FLAG):
+    subprocess.Popen([sys.executable, "btc_telegram_alerts.py"])
+    open(ENGINE_FLAG, "w").close()
+
 import json
 import os
 import streamlit as st
