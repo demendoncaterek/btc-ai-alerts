@@ -16,8 +16,6 @@ STATE_FILE = "btc_state.json"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-send_telegram("✅ TEST: BTC AI bot is live and can send alerts.")
-
 ALERT_COOLDOWN = 300         # seconds
 MIN_CONFIDENCE = 70          # only high-quality alerts
 
@@ -38,26 +36,19 @@ def send_telegram(msg: str):
 
 
 def fetch_candles(limit=60):
-    """
-    Coinbase candles endpoint:
-    GET /products/{product_id}/candles?granularity=60
-    Returns list of [time, low, high, open, close, volume]
-    """
     url = f"{COINBASE_BASE}/products/{PRODUCT}/candles"
     resp = requests.get(
         url,
         params={"granularity": GRANULARITY},
-        headers={"Accept": "application/json", "User-Agent": "btc-alerts-local"},
+        headers={"Accept": "application/json", "User-Agent": "btc-alerts"},
         timeout=10,
     )
 
     data = resp.json()
 
-    # must be a list of lists
     if not isinstance(data, list):
         raise RuntimeError(f"Coinbase API error: {data}")
 
-    # Coinbase returns newest-first; sort oldest->newest
     data.sort(key=lambda x: x[0])
     data = data[-limit:]
 
@@ -65,20 +56,15 @@ def fetch_candles(limit=60):
     closes = []
 
     for c in data:
-        ts = int(c[0])  # seconds
-        low = float(c[1])
-        high = float(c[2])
-        open_ = float(c[3])
-        close = float(c[4])
-
+        ts = int(c[0])
         candles.append({
             "time": datetime.fromtimestamp(ts).strftime("%H:%M"),
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
+            "open": float(c[3]),
+            "high": float(c[2]),
+            "low": float(c[1]),
+            "close": float(c[4]),
         })
-        closes.append(close)
+        closes.append(float(c[4]))
 
     return candles, closes
 
@@ -122,39 +108,37 @@ def atomic_write_json(path: str, obj: dict):
     os.replace(tmp, path)
 
 
+# ✅ SAFE TEST MESSAGE (after function exists)
+if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    send_telegram("✅ BTC AI bot is live and can send alerts.")
+
 # =========================
 # MAIN LOOP
 # =========================
 async def main():
     last_alert = 0
-    print("✅ BTC Alert Engine Running (AI-Filtered • Short-Term) — Data: Coinbase")
+    print("✅ BTC Alert Engine Running (AI-Filtered • Short-Term)")
 
     while True:
         try:
             candles, closes = fetch_candles(limit=60)
             price = closes[-1]
-            rsi = compute_rsi(closes, period=14)
+            rsi = compute_rsi(closes)
 
-            # momentum over last ~5 mins
-            momentum = (closes[-1] - closes[-5]) / closes[-5] if len(closes) >= 6 else 0.0
+            momentum = (closes[-1] - closes[-5]) / closes[-5] if len(closes) >= 6 else 0
             trend_strength = abs(momentum)
 
             trend = "WAIT"
             state = "WAIT"
 
-            # BUY: oversold + momentum turning up
-            if (rsi < 30) and (momentum > 0):
-                trend = "BUY"
-                state = "BUY"
-
-            # SELL: overbought + momentum turning down
-            elif (rsi > 70) and (momentum < 0):
-                trend = "SELL"
-                state = "SELL"
+            if rsi < 30 and momentum > 0:
+                trend = state = "BUY"
+            elif rsi > 70 and momentum < 0:
+                trend = state = "SELL"
 
             confidence = confidence_score(rsi, trend_strength, momentum)
 
-            state_data = {
+            atomic_write_json(STATE_FILE, {
                 "price": round(price, 2),
                 "rsi": round(rsi, 1),
                 "trend": trend,
@@ -164,24 +148,15 @@ async def main():
                 "candles": candles[-30:],
                 "notes": f"src=Coinbase • momentum={momentum:.5f}",
                 "error": "",
-            }
-
-            atomic_write_json(STATE_FILE, state_data)
+            })
 
             now = time.time()
-            if (
-                state in ["BUY", "SELL"]
-                and confidence >= MIN_CONFIDENCE
-                and (now - last_alert) > ALERT_COOLDOWN
-                and TELEGRAM_BOT_TOKEN != "PASTE_YOUR_BOT_TOKEN_HERE"
-                and TELEGRAM_CHAT_ID != "PASTE_YOUR_CHAT_ID_HERE"
-            ):
+            if state in ["BUY", "SELL"] and confidence >= MIN_CONFIDENCE and now - last_alert > ALERT_COOLDOWN:
                 send_telegram(
                     f"📢 BTC {state}\n"
                     f"Price: ${price:,.2f}\n"
                     f"RSI(1m): {round(rsi,1)}\n"
-                    f"Confidence: {confidence}%\n"
-                    f"Source: Coinbase"
+                    f"Confidence: {confidence}%"
                 )
                 last_alert = now
 
