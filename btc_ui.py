@@ -2,6 +2,7 @@ import subprocess
 import sys
 import os
 import json
+import time
 import streamlit as st
 import plotly.graph_objects as go
 
@@ -17,16 +18,25 @@ if not os.path.exists(ENGINE_FLAG):
 # =========================
 # CONFIG
 # =========================
-STATE_FILE = "btc_state.json"  # must match engine
+STATE_FILE = "btc_state.json"
+REFRESH_INTERVAL = 5  # seconds
 
 # =========================
 # STREAMLIT SETUP
 # =========================
 st.set_page_config(page_title="BTC AI Dashboard", layout="wide")
-st.autorefresh(interval=5000, key="btc_refresh")  # 🔄 auto update every 5s
-
 st.title("🧠 BTC AI Dashboard")
 st.caption("Short-term • AI-filtered • Telegram alerts")
+
+# =========================
+# AUTO REFRESH LOGIC (SAFE)
+# =========================
+now = time.time()
+last = st.session_state.get("last_refresh", 0)
+
+if now - last > REFRESH_INTERVAL:
+    st.session_state["last_refresh"] = now
+    st.rerun()
 
 # =========================
 # HELPERS
@@ -69,7 +79,6 @@ def render_candles(candles):
     )
 
     st.plotly_chart(fig, width="stretch")
-
 
 # =========================
 # LOAD STATE
@@ -119,4 +128,5 @@ render_candles(state.get("candles", []))
 # MANUAL REFRESH (OPTIONAL)
 # =========================
 if st.button("🔄 Refresh Now"):
+    st.session_state["last_refresh"] = time.time()
     st.rerun()
