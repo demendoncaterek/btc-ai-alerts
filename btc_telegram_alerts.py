@@ -13,8 +13,10 @@ PRODUCT = "BTC-USD"          # Coinbase product (USD)
 GRANULARITY = 60             # 60 seconds = 1 minute candles
 STATE_FILE = "btc_state.json"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PASTE TELEGRAM TOKEN HERE")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PASTE TELEGRAM CHAT ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+send_telegram("✅ TEST: BTC AI bot is live and can send alerts.")
 
 ALERT_COOLDOWN = 300         # seconds
 MIN_CONFIDENCE = 70          # only high-quality alerts
@@ -196,7 +198,7 @@ async def main():
                 "error": str(e),
             })
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
