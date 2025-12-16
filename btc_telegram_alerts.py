@@ -16,8 +16,8 @@ PRODUCT = "BTC-USD"
 GRANULARITY = 60  # 1 minute candles
 COINBASE_BASE = "https://api.exchange.coinbase.com"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+TELEGRAM_BOT_TOKEN = os.getenv("7586361018:AAFeb0aI25IjcR47dc9ysR7fkmL5godKXHs", "")
+TELEGRAM_CHAT_ID = str(os.getenv("5698575104", "")).strip()
 
 STATE_FILE = "btc_state.json"
 ENGINE_INTERVAL_SECONDS = float(os.getenv("ENGINE_INTERVAL_SECONDS", "5"))
