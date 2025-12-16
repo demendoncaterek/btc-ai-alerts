@@ -55,30 +55,79 @@ def safe_load_state():
 
 
 def render_candles(candles):
-    if not candles:
+    if not candles or len(candles) < 2:
         st.info("⏳ Waiting for candle data…")
         return
 
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=[c["time"] for c in candles],
-                open=[c["open"] for c in candles],
-                high=[c["high"] for c in candles],
-                low=[c["low"] for c in candles],
-                close=[c["close"] for c in candles],
-            )
-        ]
+    times = [c["time"] for c in candles]
+    opens = [c["open"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    closes = [c["close"] for c in candles]
+
+    fig = go.Figure()
+
+    # Candlesticks
+    fig.add_trace(
+        go.Candlestick(
+            x=times,
+            open=opens,
+            high=highs,
+            low=lows,
+            close=closes,
+            name="BTC"
+        )
+    )
+
+    # =========================
+    # MOMENTUM ARROWS
+    # =========================
+    arrow_x = []
+    arrow_y = []
+    arrow_color = []
+    arrow_symbol = []
+
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+
+        # Ignore tiny noise
+        if abs(delta) < closes[i] * 0.0002:
+            continue
+
+        arrow_x.append(times[i])
+
+        if delta > 0:
+            arrow_y.append(lows[i] * 0.999)
+            arrow_color.append("lime")
+            arrow_symbol.append("triangle-up")
+        else:
+            arrow_y.append(highs[i] * 1.001)
+            arrow_color.append("red")
+            arrow_symbol.append("triangle-down")
+
+    fig.add_trace(
+        go.Scatter(
+            x=arrow_x,
+            y=arrow_y,
+            mode="markers",
+            marker=dict(
+                size=10,
+                color=arrow_color,
+                symbol=arrow_symbol
+            ),
+            name="Momentum"
+        )
     )
 
     fig.update_layout(
-        height=320,
+        height=360,
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
         margin=dict(l=10, r=10, t=10, b=10),
+        showlegend=False
     )
 
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 # =========================
 # LOAD STATE
