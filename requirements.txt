@@ -1,7 +1,5 @@
 streamlit
+plotly
 requests
 numpy
-pandas
-plotly
-python-dateutil
-pytz
+streamlit-autorefresh
