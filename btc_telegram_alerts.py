@@ -1,98 +1,92 @@
 import asyncio
 import json
-import time
 import os
-import requests
-import numpy as np
+import time
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
+import numpy as np
+import requests
+
 # =========================
 # CONFIG
 # =========================
-PRODUCT = "BTC-USD"
-GRANULARITY = 60  # 1 minute candles
-COINBASE_BASE = "https://api.exchange.coinbase.com"
+PRODUCT = os.getenv("PRODUCT", "BTC-USD")
+GRANULARITY = int(os.getenv("GRANULARITY", "60"))  # seconds (1m)
+COINBASE_BASE = os.getenv("COINBASE_BASE", "https://api.exchange.coinbase.com")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-STATE_FILE = "btc_state.json"
-ENGINE_INTERVAL_SECONDS = float(os.getenv("ENGINE_INTERVAL_SECONDS", "5"))
-
-# Alerts (real Telegram alerts)
 ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "300"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 
-# Paper trading (sim)
+# “Bot is alive” heartbeat
+HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "3600"))
+
+# Manual trade logging
+MANUAL_FILE = os.getenv("MANUAL_TRADES_FILE", "manual_trades.json")
+
+# Paper trading
+PAPER_STATE_FILE = os.getenv("PAPER_STATE_FILE", "paper_state.json")
 PAPER_START_CASH = float(os.getenv("PAPER_START_CASH", "1000"))
-PAPER_MIN_CONFIDENCE = int(os.getenv("PAPER_MIN_CONFIDENCE", "55"))
-
-# Heartbeat (to know bot is alive)
-HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "3600"))  # 1 hour default
-
-# Files for persistence
-MANUAL_FILE = "manual_trades.json"
-PAPER_FILE = "paper_trades.json"
 
 PORT = int(os.getenv("PORT", "8080"))
 
 # =========================
-# STORAGE (in memory)
+# STATE (shared)
 # =========================
 state_lock = threading.Lock()
-
 latest_state = {
-    "price": 0,
-    "rsi": 0,
+    "price": 0.0,
+    "rsi": 0.0,
     "trend": "WAIT",
     "state": "WAIT",
     "confidence": 0,
     "time": "--:--:--",
     "candles": [],
     "notes": "",
-    "error": "Starting…",
-    "signal": "WAIT",
-    "momentum": 0.0,
+    "error": "",
+    "paper": {},
+    "manual": {},
 }
 
-def load_json(path: str, default_obj):
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                raw = f.read().strip()
-                if raw:
-                    return json.loads(raw)
-    except:
-        pass
-    return default_obj
+paper_state = {
+    "cash_usd": PAPER_START_CASH,
+    "qty_btc": 0.0,
+    "entry_price": None,
+    "realized_pl_usd": 0.0,
+    "last_action": "WAIT",
+    "last_action_time": None,
+}
 
+manual_state = {
+    "qty_btc": 0.0,
+    "cost_basis_usd": 0.0,
+    "realized_pl_usd": 0.0,
+    "trades": [],
+}
+
+# =========================
+# HELPERS
+# =========================
 def atomic_write_json(path: str, obj: dict):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f)
     os.replace(tmp, path)
 
-manual_state = load_json(MANUAL_FILE, {
-    "trades": [],
-    "qty_btc": 0.0,
-    "cost_basis_usd": 0.0,
-    "realized_pl_usd": 0.0,
-})
+def safe_load_json(path: str, default_obj: dict):
+    if not os.path.exists(path):
+        return default_obj
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default_obj
 
-paper_state = load_json(PAPER_FILE, {
-    "cash_usd": PAPER_START_CASH,
-    "qty_btc": 0.0,
-    "entry_price": None,
-    "realized_pl_usd": 0.0,
-    "trades": [],
-})
-
-# =========================
-# TELEGRAM
-# =========================
 def send_telegram(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -100,23 +94,93 @@ def send_telegram(msg: str):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10,
+            timeout=8,
         )
-    except:
+    except Exception:
         pass
 
-def telegram_delete_webhook():
-    if not TELEGRAM_BOT_TOKEN:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
-            json={"drop_pending_updates": False},
-            timeout=10,
-        )
-    except:
-        pass
+def fetch_candles(limit=60):
+    url = f"{COINBASE_BASE}/products/{PRODUCT}/candles"
+    resp = requests.get(
+        url,
+        params={"granularity": GRANULARITY},
+        headers={"Accept": "application/json", "User-Agent": "btc-alerts"},
+        timeout=10,
+    )
+    data = resp.json()
+    if not isinstance(data, list):
+        raise RuntimeError(f"Coinbase API error: {data}")
 
+    data.sort(key=lambda x: x[0])
+    data = data[-limit:]
+
+    candles = []
+    closes = []
+    for c in data:
+        ts = int(c[0])
+        # Coinbase candle order: [ time, low, high, open, close, volume ]
+        candles.append({
+            "time": datetime.fromtimestamp(ts).strftime("%H:%M"),
+            "open": float(c[3]),
+            "high": float(c[2]),
+            "low": float(c[1]),
+            "close": float(c[4]),
+        })
+        closes.append(float(c[4]))
+
+    return candles, closes
+
+def compute_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return 50.0
+    deltas = np.diff(prices)
+    gains = np.maximum(deltas, 0)
+    losses = -np.minimum(deltas, 0)
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def confidence_score(rsi, trend_strength, momentum):
+    score = 0
+    if rsi < 30 or rsi > 70:
+        score += 35
+    elif 35 <= rsi <= 65:
+        score -= 10
+    score += min(abs(momentum) * 2000, 25)
+    score += min(trend_strength * 2000, 25)
+    return max(0, min(100, int(score)))
+
+# =========================
+# PAPER TRADER
+# =========================
+def paper_step(signal: str, price: float, now_str: str):
+    # Simple “all in / all out” for demo paper trading
+    global paper_state
+    if signal == "BUY" and paper_state["cash_usd"] > 0:
+        qty = paper_state["cash_usd"] / price
+        paper_state["qty_btc"] += qty
+        paper_state["entry_price"] = price
+        paper_state["cash_usd"] = 0.0
+        paper_state["last_action"] = "BUY"
+        paper_state["last_action_time"] = now_str
+    elif signal == "SELL" and paper_state["qty_btc"] > 0:
+        proceeds = paper_state["qty_btc"] * price
+        entry = paper_state["entry_price"] or price
+        pnl = proceeds - (paper_state["qty_btc"] * entry)
+        paper_state["realized_pl_usd"] += pnl
+        paper_state["cash_usd"] = proceeds
+        paper_state["qty_btc"] = 0.0
+        paper_state["entry_price"] = None
+        paper_state["last_action"] = "SELL"
+        paper_state["last_action_time"] = now_str
+    atomic_write_json(PAPER_STATE_FILE, paper_state)
+
+# =========================
+# MANUAL (LOGGED) TRADES
+# =========================
 def build_status_text():
     with state_lock:
         s = dict(latest_state)
@@ -160,13 +224,11 @@ def build_status_text():
     )
 
 def handle_manual_trade(side: str, usd_amount: float):
-    # side: BUY / SELL
     with state_lock:
         price = float(latest_state.get("price", 0) or 0)
 
     if price <= 0:
         return "Engine has no price yet. Try again in a few seconds."
-
     if usd_amount <= 0:
         return "Amount must be > 0. Example: /logbuy 100"
 
@@ -190,7 +252,6 @@ def handle_manual_trade(side: str, usd_amount: float):
             return "You have 0 BTC logged. Use /logbuy first."
 
         sell_qty = min(qty, manual_state["qty_btc"])
-        # avg cost method
         avg_cost = (manual_state["cost_basis_usd"] / manual_state["qty_btc"]) if manual_state["qty_btc"] > 0 else 0
         cost_sold = avg_cost * sell_qty
         proceeds = sell_qty * price
@@ -212,34 +273,54 @@ def handle_manual_trade(side: str, usd_amount: float):
 
     return "Unknown trade side."
 
+# =========================
+# TELEGRAM COMMANDS (polling)
+# =========================
+def telegram_delete_webhook():
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            params={"drop_pending_updates": True},
+            timeout=8,
+        )
+    except Exception:
+        pass
+
+def telegram_get_updates(offset: int):
+    resp = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+        params={"timeout": 10, "offset": offset},
+        timeout=15,
+    )
+    data = resp.json()
+    if not data.get("ok"):
+        return [], offset
+    updates = data.get("result", [])
+    if updates:
+        offset = updates[-1]["update_id"] + 1
+    return updates, offset
+
 def telegram_poll_loop():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
     telegram_delete_webhook()
     offset = 0
+    send_telegram("✅ BTC AI bot is live. Use /status")
 
     while True:
         try:
-            resp = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                params={"timeout": 50, "offset": offset},
-                timeout=60,
-            )
-            data = resp.json()
-            results = data.get("result", [])
-
-            for upd in results:
-                offset = max(offset, int(upd.get("update_id", 0)) + 1)
+            updates, offset = telegram_get_updates(offset)
+            for upd in updates:
                 msg = upd.get("message") or upd.get("edited_message")
                 if not msg:
                     continue
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue
 
-                chat_id = str(msg.get("chat", {}).get("id", "")).strip()
                 text = (msg.get("text") or "").strip()
-
-                # only respond to your configured chat
-                if chat_id != TELEGRAM_CHAT_ID:
+                if not text:
                     continue
 
                 if text.startswith("/status"):
@@ -249,135 +330,44 @@ def telegram_poll_loop():
                     parts = text.split()
                     if len(parts) != 2:
                         send_telegram("Usage: /logbuy 100")
-                    else:
-                        try:
-                            amt = float(parts[1])
-                            send_telegram(handle_manual_trade("BUY", amt))
-                        except:
-                            send_telegram("Usage: /logbuy 100")
+                        continue
+                    try:
+                        amt = float(parts[1])
+                    except Exception:
+                        send_telegram("Usage: /logbuy 100")
+                        continue
+                    send_telegram(handle_manual_trade("BUY", amt))
 
                 elif text.startswith("/logsell"):
                     parts = text.split()
                     if len(parts) != 2:
                         send_telegram("Usage: /logsell 100")
-                    else:
-                        try:
-                            amt = float(parts[1])
-                            send_telegram(handle_manual_trade("SELL", amt))
-                        except:
-                            send_telegram("Usage: /logsell 100")
+                        continue
+                    try:
+                        amt = float(parts[1])
+                    except Exception:
+                        send_telegram("Usage: /logsell 100")
+                        continue
+                    send_telegram(handle_manual_trade("SELL", amt))
 
-        except:
+                elif text.startswith("/clearlogs"):
+                    manual_state["qty_btc"] = 0.0
+                    manual_state["cost_basis_usd"] = 0.0
+                    manual_state["realized_pl_usd"] = 0.0
+                    manual_state["trades"] = []
+                    atomic_write_json(MANUAL_FILE, manual_state)
+                    send_telegram("🧹 Cleared manual trade logs.")
+
+        except Exception:
             pass
 
-        time.sleep(1)
+        time.sleep(2)
 
 # =========================
-# MARKET DATA / SIGNALS
-# =========================
-def fetch_candles(limit=60):
-    url = f"{COINBASE_BASE}/products/{PRODUCT}/candles"
-    resp = requests.get(
-        url,
-        params={"granularity": GRANULARITY},
-        headers={"Accept": "application/json", "User-Agent": "btc-alerts"},
-        timeout=10,
-    )
-    data = resp.json()
-    if not isinstance(data, list):
-        raise RuntimeError(f"Coinbase API error: {data}")
-
-    data.sort(key=lambda x: x[0])
-    data = data[-limit:]
-
-    candles = []
-    closes = []
-    for c in data:
-        ts = int(c[0])
-        candles.append({
-            "time": datetime.fromtimestamp(ts).strftime("%H:%M"),
-            "open": float(c[3]),
-            "high": float(c[2]),
-            "low": float(c[1]),
-            "close": float(c[4]),
-        })
-        closes.append(float(c[4]))
-
-    return candles, closes
-
-def compute_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50.0
-
-    deltas = np.diff(prices)
-    gains = np.maximum(deltas, 0)
-    losses = -np.minimum(deltas, 0)
-
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def confidence_score(rsi, trend_strength, momentum):
-    score = 0
-    if rsi < 30 or rsi > 70:
-        score += 35
-    elif 35 <= rsi <= 65:
-        score -= 10
-
-    score += min(abs(momentum) * 2000, 25)
-    score += min(trend_strength * 2000, 25)
-    return max(0, min(100, int(score)))
-
-def update_paper(signal: str, confidence: int, price: float):
-    if price <= 0:
-        return
-
-    # only take paper actions when confidence is decent
-    if confidence < PAPER_MIN_CONFIDENCE:
-        return
-
-    if signal == "BUY" and paper_state["qty_btc"] <= 0 and paper_state["cash_usd"] > 0:
-        qty = paper_state["cash_usd"] / price
-        paper_state["qty_btc"] = qty
-        paper_state["entry_price"] = price
-        paper_state["trades"].append({
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "side": "BUY",
-            "price": round(price, 2),
-            "qty_btc": qty,
-        })
-        paper_state["cash_usd"] = 0.0
-        atomic_write_json(PAPER_FILE, paper_state)
-
-    elif signal == "SELL" and paper_state["qty_btc"] > 0:
-        qty = paper_state["qty_btc"]
-        entry = float(paper_state["entry_price"] or price)
-        proceeds = qty * price
-        pnl = (price - entry) * qty
-
-        paper_state["cash_usd"] = proceeds
-        paper_state["qty_btc"] = 0.0
-        paper_state["entry_price"] = None
-        paper_state["realized_pl_usd"] += pnl
-        paper_state["trades"].append({
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "side": "SELL",
-            "price": round(price, 2),
-            "qty_btc": qty,
-            "pnl_usd": round(pnl, 2),
-        })
-        atomic_write_json(PAPER_FILE, paper_state)
-
-# =========================
-# HTTP API (for UI)
+# HTTP API
 # =========================
 class Handler(BaseHTTPRequestHandler):
-    def _json(self, code: int, obj: dict):
+    def _json(self, obj, code=200):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -386,114 +376,87 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        path = urlparse(self.path).path
-
-        if path == "/health":
-            return self._json(200, {"ok": True})
-
-        if path == "/state":
+        p = urlparse(self.path)
+        if p.path == "/health":
+            return self._json({"ok": True, "time": datetime.now().isoformat()})
+        if p.path == "/state":
             with state_lock:
-                s = dict(latest_state)
+                return self._json(latest_state)
+        return self._json({"error": "not found"}, code=404)
 
-            # attach paper + manual summaries for UI
-            price = float(s.get("price", 0) or 0)
-            p_equity = paper_state["cash_usd"] + paper_state["qty_btc"] * price
-            p_unreal = 0.0
-            if paper_state.get("entry_price") and paper_state["qty_btc"] > 0:
-                p_unreal = (price - float(paper_state["entry_price"])) * paper_state["qty_btc"]
-
-            m_unreal = (manual_state["qty_btc"] * price) - manual_state["cost_basis_usd"]
-            m_total = manual_state["realized_pl_usd"] + m_unreal
-
-            s["paper"] = {
-                "cash_usd": paper_state["cash_usd"],
-                "qty_btc": paper_state["qty_btc"],
-                "equity_usd": p_equity,
-                "realized_pl_usd": paper_state["realized_pl_usd"],
-                "unrealized_pl_usd": p_unreal,
-                "last_trade": paper_state["trades"][-1] if paper_state["trades"] else None,
-            }
-            s["manual"] = {
-                "qty_btc": manual_state["qty_btc"],
-                "cost_basis_usd": manual_state["cost_basis_usd"],
-                "realized_pl_usd": manual_state["realized_pl_usd"],
-                "unrealized_pl_usd": m_unreal,
-                "total_pl_usd": m_total,
-                "last_trade": manual_state["trades"][-1] if manual_state["trades"] else None,
-            }
-
-            return self._json(200, s)
-
-        return self._json(404, {"error": "Not found"})
+def run_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"🌐 Serving HTTP on 0.0.0.0:{PORT}")
+    server.serve_forever()
 
 # =========================
 # MAIN LOOP
 # =========================
-async def main_loop():
+async def engine_loop():
+    global paper_state, manual_state
+    paper_state = safe_load_json(PAPER_STATE_FILE, paper_state)
+    manual_state = safe_load_json(MANUAL_FILE, manual_state)
+
     last_alert = 0.0
     last_heartbeat = 0.0
 
-    # startup msg once (if configured)
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        send_telegram("✅ BTC AI bot started. Use /status anytime.")
+    print("✅ BTC Alert Engine Running (AI-Filtered • Short-Term)")
 
     while True:
         try:
             candles, closes = fetch_candles(limit=60)
-            price = float(closes[-1])
-            rsi = float(compute_rsi(closes))
+            price = closes[-1]
+            rsi = compute_rsi(closes)
 
-            momentum = 0.0
-            if len(closes) >= 6 and closes[-5] != 0:
-                momentum = (closes[-1] - closes[-5]) / closes[-5]
-
+            momentum = (closes[-1] - closes[-5]) / closes[-5] if len(closes) >= 6 else 0.0
             trend_strength = abs(momentum)
 
+            trend = "WAIT"
             signal = "WAIT"
             if rsi < 30 and momentum > 0:
-                signal = "BUY"
+                trend = signal = "BUY"
             elif rsi > 70 and momentum < 0:
-                signal = "SELL"
+                trend = signal = "SELL"
 
-            confidence = confidence_score(rsi, trend_strength, momentum)
+            conf = confidence_score(rsi, trend_strength, momentum)
+            now_str = datetime.now().strftime("%H:%M:%S")
 
+            # paper trading step
+            if signal in ("BUY", "SELL") and conf >= MIN_CONFIDENCE:
+                paper_step(signal, price, now_str)
+
+            # update shared state
             with state_lock:
                 latest_state.update({
                     "price": round(price, 2),
                     "rsi": round(rsi, 1),
-                    "trend": signal if signal != "WAIT" else "WAIT",
-                    "state": signal if signal != "WAIT" else "WAIT",
-                    "signal": signal,
-                    "confidence": int(confidence),
-                    "momentum": float(momentum),
-                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "trend": trend,
+                    "state": signal,
+                    "confidence": conf,
+                    "time": now_str,
                     "candles": candles[-30:],
-                    "notes": f"src=Coinbase • momentum={momentum:.5f}",
+                    "notes": f"src=Coinbase • momentum={momentum:+.5f}",
                     "error": "",
+                    "paper": dict(paper_state),
+                    "manual": dict(manual_state),
                 })
 
-            atomic_write_json(STATE_FILE, latest_state)
-
-            # paper sim
-            update_paper(signal, confidence, price)
-
-            # real alerts (filtered)
+            # alerts (only on strong signals)
             now = time.time()
-            if signal in ["BUY", "SELL"] and confidence >= MIN_CONFIDENCE and (now - last_alert) > ALERT_COOLDOWN:
+            if signal in ("BUY", "SELL") and conf >= MIN_CONFIDENCE and (now - last_alert) > ALERT_COOLDOWN:
                 send_telegram(
-                    f"📢 BTC {signal} ALERT\n"
+                    f"📢 BTC {signal}\n"
                     f"Price: ${price:,.2f}\n"
                     f"RSI(1m): {round(rsi,1)}\n"
-                    f"Confidence: {confidence}%\n"
-                    f"Momentum(5m): {momentum:+.4f}"
+                    f"Confidence: {conf}%\n"
+                    f"Momentum: {momentum:+.5f}"
                 )
                 last_alert = now
 
-            # heartbeat (to prove it's alive)
-            if HEARTBEAT_SECONDS > 0 and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                if (now - last_heartbeat) > HEARTBEAT_SECONDS:
-                    send_telegram(f"💓 Heartbeat: ${price:,.2f} | RSI {round(rsi,1)} | {signal} | conf {confidence}%")
-                    last_heartbeat = now
+            # heartbeat
+            if HEARTBEAT_INTERVAL_SECONDS > 0 and (now - last_heartbeat) > HEARTBEAT_INTERVAL_SECONDS:
+                send_telegram(f"💓 BTC AI heartbeat  Price: ${price:,.2f}  RSI(1m): {round(rsi,1)}")
+                last_heartbeat = now
 
         except Exception as e:
             with state_lock:
@@ -501,22 +464,18 @@ async def main_loop():
                     "error": str(e),
                     "time": datetime.now().strftime("%H:%M:%S"),
                 })
-            atomic_write_json(STATE_FILE, latest_state)
 
-        await asyncio.sleep(ENGINE_INTERVAL_SECONDS)
+        await asyncio.sleep(5)
 
-def run_http_server():
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    server.serve_forever()
+def main():
+    # start HTTP server
+    threading.Thread(target=run_http_server, daemon=True).start()
+
+    # start telegram polling (if configured)
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        threading.Thread(target=telegram_poll_loop, daemon=True).start()
+
+    asyncio.run(engine_loop())
 
 if __name__ == "__main__":
-    # HTTP server thread (for /state)
-    t = threading.Thread(target=run_http_server, daemon=True)
-    t.start()
-
-    # Telegram command poll thread
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        tp = threading.Thread(target=telegram_poll_loop, daemon=True)
-        tp.start()
-
-    asyncio.run(main_loop())
+    main()
