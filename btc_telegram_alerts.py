@@ -31,7 +31,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
 
 # Heartbeat: 0 disables (ex: 60 = hourly)
-HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "0"))
+HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "75"))
 
 # Startup message toggle: 1 = on, 0 = off
 STARTUP_MESSAGE = os.getenv("STARTUP_MESSAGE", "1").strip() == "1"
