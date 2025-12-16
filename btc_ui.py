@@ -1,128 +1,120 @@
 import os
-import json
-import time
 import requests
 import streamlit as st
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
-ENGINE_URL = os.getenv("ENGINE_URL", "").strip()
-AUTO_REFRESH_MS = int(os.getenv("AUTO_REFRESH_MS", "5000"))
-
-def normalize_engine_url(url: str) -> str:
-    url = (url or "").strip()
-    if not url:
-        return ""
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = "http://" + url
-    # no trailing slash
-    url = url.rstrip("/")
-    # if they gave railway.internal without port, default to 8080
-    if ".railway.internal" in url:
-        # if no explicit port in hostname
-        host = url.split("://", 1)[1]
-        if ":" not in host:
-            url = url + ":8080"
-    return url
-
-ENGINE_URL = normalize_engine_url(ENGINE_URL)
+ENGINE_URL = os.getenv("ENGINE_URL", "").strip().rstrip("/")
+UI_REFRESH_MS = int(os.getenv("UI_REFRESH_MS", "5000"))
 
 st.set_page_config(page_title="BTC AI Dashboard", layout="wide")
 st.title("🧠 BTC AI Dashboard")
 st.caption("Short-term • AI-filtered • Telegram alerts • Paper + Real (logged) P/L")
 
-st_autorefresh(interval=AUTO_REFRESH_MS, key="btc_refresh")
+st_autorefresh(interval=UI_REFRESH_MS, key="btc_refresh")
 
-def fetch_state():
+def fetch_json(url: str, timeout=6):
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def get_engine_state():
     if not ENGINE_URL:
-        return None, "ENGINE_URL not set"
+        return None, "ENGINE_URL is not set."
     try:
-        r = requests.get(f"{ENGINE_URL}/state", timeout=4)
-        r.raise_for_status()
-        return r.json(), ""
+        return fetch_json(f"{ENGINE_URL}/state", timeout=6), ""
     except Exception as e:
         return None, str(e)
 
-def render_candles(candles, momentum):
+def ping_health():
+    if not ENGINE_URL:
+        return None, "ENGINE_URL is not set."
+    try:
+        return fetch_json(f"{ENGINE_URL}/health", timeout=4), ""
+    except Exception as e:
+        return None, str(e)
+
+def render_candles_with_momentum(candles):
     if not candles:
         st.info("⏳ Waiting for candle data…")
         return
 
-    xs = [c["time"] for c in candles]
+    x = [c["time"] for c in candles]
+    opens = [c["open"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
     closes = [c["close"] for c in candles]
 
     fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=xs,
-                open=[c["open"] for c in candles],
-                high=[c["high"] for c in candles],
-                low=[c["low"] for c in candles],
-                close=closes,
-            )
-        ]
+        data=[go.Candlestick(x=x, open=opens, high=highs, low=lows, close=closes, name="BTC")]
     )
 
-    # Momentum arrows (simple: show arrow on latest candle, direction from momentum sign)
-    if closes and momentum is not None:
-        last_x = xs[-1]
-        last_y = closes[-1]
-        arrow = "▲" if momentum > 0 else "▼" if momentum < 0 else "•"
-        fig.add_annotation(
-            x=last_x,
-            y=last_y,
-            text=arrow,
-            showarrow=False,
-            font=dict(size=22),
-            yshift=18 if momentum > 0 else -18 if momentum < 0 else 0,
-        )
+    # Momentum arrows (5-candle momentum)
+    up_x, up_y, dn_x, dn_y = [], [], [], []
+    for i in range(len(closes)):
+        if i < 5:
+            continue
+        prev = closes[i - 5]
+        if prev == 0:
+            continue
+        mom = (closes[i] - prev) / prev
+        if mom > 0.001:
+            up_x.append(x[i]); up_y.append(highs[i] * 1.0005)
+        elif mom < -0.001:
+            dn_x.append(x[i]); dn_y.append(lows[i] * 0.9995)
+
+    if up_x:
+        fig.add_trace(go.Scatter(x=up_x, y=up_y, mode="markers",
+                                 marker=dict(symbol="triangle-up", size=10),
+                                 name="Momentum ↑"))
+    if dn_x:
+        fig.add_trace(go.Scatter(x=dn_x, y=dn_y, mode="markers",
+                                 marker=dict(symbol="triangle-down", size=10),
+                                 name="Momentum ↓"))
 
     fig.update_layout(
-        height=360,
+        height=380,
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
         margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h"),
     )
     st.plotly_chart(fig, use_container_width=True)
 
-state, err = fetch_state()
+state, err = get_engine_state()
+
+with st.expander("Debug (click to open)", expanded=not bool(state)):
+    st.write(f"ENGINE_URL: {ENGINE_URL or '(not set)'}")
+    cdbg1, cdbg2 = st.columns([1, 3])
+    with cdbg1:
+        if st.button("Ping engine /health"):
+            data, herr = ping_health()
+            if herr:
+                st.error(herr)
+            else:
+                st.success("Health OK")
+                st.json(data)
+    with cdbg2:
+        if err:
+            st.error(err)
+        else:
+            st.caption("Engine reachable.")
 
 if not state:
     st.info("⏳ Waiting for engine data…")
-    st.caption("Make sure ENGINE_URL points to your btc-engine service URL and /health works.")
-    with st.expander("Debug (click to open)"):
-        st.write(f"ENGINE_URL: {ENGINE_URL or '(not set)'}")
-        st.error(err)
-        st.code("Expected ENGINE_URL examples:\n- https://<btc-engine>.up.railway.app\n- http://btc-engine.railway.internal:8080")
     st.stop()
 
 if state.get("error"):
     st.error(f"Engine error: {state['error']}")
 
-price = float(state.get("price", 0) or 0)
-rsi = float(state.get("rsi", 0) or 0)
-trend = state.get("trend", "WAIT")
-conf = int(state.get("confidence", 0) or 0)
-notes = state.get("notes", "")
-t = state.get("time", "--:--:--")
-
-# derive momentum from notes if present
-momentum = None
-try:
-    # notes like: "src=Coinbase • momentum=+0.00123"
-    if "momentum=" in notes:
-        momentum = float(notes.split("momentum=")[-1].strip())
-except Exception:
-    momentum = None
-
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("BTC Price", f"${price:,.2f}")
-c2.metric("RSI (1m)", f"{rsi:.1f}")
-c3.metric("Trend", trend)
-c4.metric("🧠 Confidence", f"{conf}%")
+c1.metric("BTC Price", f"${state.get('price', 0):,.2f}")
+c2.metric("RSI (1m)", state.get("rsi", 0))
+c3.metric("Trend", state.get("trend", "WAIT"))
+c4.metric("🧠 Confidence", f"{state.get('confidence', 0)}%")
+st.caption(f"Last update: {state.get('time','--:--:--')}  •  {state.get('notes','')}")
 
-st.caption(f"Last update: {t}  •  {notes}")
-
+conf = state.get("confidence", 0)
 if conf >= 75:
     st.success("🔥 High-quality setup")
 elif conf >= 60:
@@ -130,43 +122,34 @@ elif conf >= 60:
 else:
     st.info("⏳ Waiting for stronger conditions")
 
-# Paper + Manual P/L
 paper = state.get("paper", {}) or {}
 manual = state.get("manual", {}) or {}
 
-p_cash = float(paper.get("cash_usd", 0) or 0)
-p_qty = float(paper.get("qty_btc", 0) or 0)
-p_real = float(paper.get("realized_pl_usd", 0) or 0)
-p_entry = paper.get("entry_price", None)
-p_unreal = 0.0
-if p_entry and p_qty > 0 and price > 0:
-    p_unreal = (price - float(p_entry)) * p_qty
-p_equity = p_cash + (p_qty * price)
+p1, p2, p3, p4 = st.columns(4)
+p1.metric("📄 Paper P/L (total)", f"${paper.get('total_pl_usd', 0):,.2f}")
+p2.metric("📄 Paper Position (BTC)", f"{paper.get('btc', 0):.6f}")
+p3.metric("🧾 Real P/L (total)", f"${manual.get('total_pl_usd', 0):,.2f}")
+p4.metric("🧾 Real Position (BTC)", f"{manual.get('btc', 0):.6f}")
 
-m_qty = float(manual.get("qty_btc", 0) or 0)
-m_cost = float(manual.get("cost_basis_usd", 0) or 0)
-m_real = float(manual.get("realized_pl_usd", 0) or 0)
-m_unreal = (m_qty * price) - m_cost
-m_total = m_real + m_unreal
+st.subheader("📊 BTC 1-Minute Candlesticks (Last 30 min) + Momentum Arrows")
+render_candles_with_momentum(state.get("candles", []))
 
-st.subheader("📈 P/L")
-pc1, pc2 = st.columns(2)
-with pc1:
-    st.markdown("**🧾 Paper**")
-    st.write(f"Equity: **${p_equity:,.2f}**")
-    st.write(f"Realized P/L: **${p_real:,.2f}**")
-    st.write(f"Unrealized P/L: **${p_unreal:,.2f}**")
-    st.write(f"Holdings: **{p_qty:.8f} BTC**  •  Cash: **${p_cash:,.2f}**")
-with pc2:
-    st.markdown("**🧍 Real (logged)**")
-    st.write(f"Total P/L: **${m_total:,.2f}**")
-    st.write(f"Realized P/L: **${m_real:,.2f}**")
-    st.write(f"Unrealized P/L: **${m_unreal:,.2f}**")
-    st.write(f"Holdings: **{m_qty:.8f} BTC**  •  Cost basis: **${m_cost:,.2f}**")
-    st.caption("Log trades in Telegram: /logbuy 100 or /logsell 100")
+st.subheader("🧾 Trades")
+t1, t2 = st.columns(2)
+with t1:
+    st.write("📄 Paper trades (latest)")
+    st.dataframe(paper.get("trades", [])[-20:], use_container_width=True, height=240)
+with t2:
+    st.write("🧾 Real (logged) trades (latest)")
+    st.dataframe(manual.get("trades", [])[-20:], use_container_width=True, height=240)
 
-st.subheader("📊 BTC 1-Minute Candlesticks (Last 30 min)")
-render_candles(state.get("candles", []), momentum)
+st.markdown(
+    """
+**Telegram commands (manual logging):**
+- `/status` — shows current price/RSI/trend + P/L  
+- `/logbuy 100` — logs a real buy of **$100** at current price  
+- `/logsell 100` — logs a real sell of **$100** at current price  
 
-if st.button("🔄 Refresh Now"):
-    st.rerun()
+*(This dashboard is paper/record-keeping. It does not place real trades.)*
+"""
+)
