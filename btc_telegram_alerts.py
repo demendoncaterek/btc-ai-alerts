@@ -1,149 +1,292 @@
 import asyncio
 import json
-import os
 import time
+import os
+import requests
+import numpy as np
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
-
-import numpy as np
-import requests
 
 # =========================
 # CONFIG
 # =========================
 PRODUCT = "BTC-USD"
-GRANULARITY = 60  # 1-minute candles
+GRANULARITY = 60  # 1 minute candles
 COINBASE_BASE = "https://api.exchange.coinbase.com"
 
-STATE_FILE = "btc_state.json"          # optional debug file
-PERSIST_FILE = "trade_state.json"      # stores paper + real trade logs
-
-ENGINE_TICK_SECONDS = int(os.getenv("ENGINE_TICK_SECONDS", "5"))
-
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "300"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
-
-# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
 
-# Heartbeat: 0 disables (ex: 60 = hourly)
-HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "75"))
+STATE_FILE = "btc_state.json"
+ENGINE_INTERVAL_SECONDS = float(os.getenv("ENGINE_INTERVAL_SECONDS", "5"))
 
-# Startup message toggle: 1 = on, 0 = off
-STARTUP_MESSAGE = os.getenv("STARTUP_MESSAGE", "1").strip() == "1"
+# Alerts (real Telegram alerts)
+ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "300"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 
-# Paper trading
-PAPER_START_CASH = float(os.getenv("PAPER_START_CASH", "10000"))
+# Paper trading (sim)
+PAPER_START_CASH = float(os.getenv("PAPER_START_CASH", "1000"))
+PAPER_MIN_CONFIDENCE = int(os.getenv("PAPER_MIN_CONFIDENCE", "55"))
 
-# HTTP server
-PORT = int(os.getenv("PORT", "8000"))  # Railway sets PORT automatically; this reads it if present
+# Heartbeat (to know bot is alive)
+HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "3600"))  # 1 hour default
 
+# Files for persistence
+MANUAL_FILE = "manual_trades.json"
+PAPER_FILE = "paper_trades.json"
+
+PORT = int(os.getenv("PORT", "8080"))
 
 # =========================
-# GLOBAL STATE (thread-safe)
+# STORAGE (in memory)
 # =========================
 state_lock = threading.Lock()
 
-STATE = {
-    "price": 0.0,
-    "rsi": 0.0,
+latest_state = {
+    "price": 0,
+    "rsi": 0,
     "trend": "WAIT",
     "state": "WAIT",
     "confidence": 0,
-    "momentum": 0.0,
     "time": "--:--:--",
     "candles": [],
     "notes": "",
-    "error": "",
-    "paper": {},
-    "real": {},
-    "trades": {"paper": [], "real": []},
+    "error": "Starting…",
+    "signal": "WAIT",
+    "momentum": 0.0,
 }
 
-PERSIST = {
-    "paper": {
-        "start_cash": PAPER_START_CASH,
-        "cash": PAPER_START_CASH,
-        "btc": 0.0,
-        "cost_basis": 0.0,          # total USD spent on current holdings
-        "realized_pl": 0.0,
-        "last_trade_ts": 0.0,
-    },
-    "real": {
-        # purely tracked from your /log commands
-        "cash": 0.0,
-        "btc": 0.0,
-        "cost_basis": 0.0,
-        "realized_pl": 0.0,
-    },
-    "trades": {"paper": [], "real": []},
-    "telegram": {"offset": 0},
-    "engine": {"started_at": time.time()},
-}
-
-persist_lock = threading.Lock()
-
-
-# =========================
-# UTIL
-# =========================
-def now_str():
-    return datetime.now().strftime("%H:%M:%S")
-
-def safe_load_json(path, default):
+def load_json(path: str, default_obj):
     try:
-        if not os.path.exists(path):
-            return default
-        with open(path, "r", encoding="utf-8") as f:
-            raw = f.read().strip()
-        if not raw:
-            return default
-        return json.loads(raw)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                if raw:
+                    return json.loads(raw)
     except:
-        return default
+        pass
+    return default_obj
 
-def atomic_write_json(path, obj):
+def atomic_write_json(path: str, obj: dict):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f)
     os.replace(tmp, path)
 
+manual_state = load_json(MANUAL_FILE, {
+    "trades": [],
+    "qty_btc": 0.0,
+    "cost_basis_usd": 0.0,
+    "realized_pl_usd": 0.0,
+})
+
+paper_state = load_json(PAPER_FILE, {
+    "cash_usd": PAPER_START_CASH,
+    "qty_btc": 0.0,
+    "entry_price": None,
+    "realized_pl_usd": 0.0,
+    "trades": [],
+})
+
+# =========================
+# TELEGRAM
+# =========================
 def send_telegram(msg: str):
-    if not TELEGRAM_BOT_TOKEN or not TELELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=8,
+            timeout=10,
         )
     except:
         pass
 
-# Fix typo-safe: if you ever accidentally renamed the var
-TELELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID
+def telegram_delete_webhook():
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            json={"drop_pending_updates": False},
+            timeout=10,
+        )
+    except:
+        pass
 
+def build_status_text():
+    with state_lock:
+        s = dict(latest_state)
+
+    price = s.get("price", 0)
+    rsi = s.get("rsi", 0)
+    trend = s.get("trend", "WAIT")
+    conf = s.get("confidence", 0)
+    t = s.get("time", "--:--:--")
+
+    # paper
+    p_cash = paper_state["cash_usd"]
+    p_qty = paper_state["qty_btc"]
+    p_equity = p_cash + (p_qty * price)
+    p_unreal = 0.0
+    if paper_state.get("entry_price") and p_qty > 0:
+        p_unreal = (price - float(paper_state["entry_price"])) * p_qty
+
+    # manual
+    m_qty = manual_state["qty_btc"]
+    m_cost = manual_state["cost_basis_usd"]
+    m_unreal = (m_qty * price) - m_cost
+    m_total = manual_state["realized_pl_usd"] + m_unreal
+
+    return (
+        f"📊 BTC STATUS\n"
+        f"Price: ${price:,.2f}\n"
+        f"RSI(1m): {rsi}\n"
+        f"Trend: {trend}\n"
+        f"Confidence: {conf}%\n"
+        f"Updated: {t}\n\n"
+        f"🧾 PAPER\n"
+        f"Equity: ${p_equity:,.2f}\n"
+        f"Realized P/L: ${paper_state['realized_pl_usd']:,.2f}\n"
+        f"Unrealized P/L: ${p_unreal:,.2f}\n\n"
+        f"🧍 REAL (logged)\n"
+        f"BTC: {m_qty:.8f}\n"
+        f"Realized P/L: ${manual_state['realized_pl_usd']:,.2f}\n"
+        f"Total P/L: ${m_total:,.2f}\n\n"
+        f"Commands: /status, /logbuy 100, /logsell 100"
+    )
+
+def handle_manual_trade(side: str, usd_amount: float):
+    # side: BUY / SELL
+    with state_lock:
+        price = float(latest_state.get("price", 0) or 0)
+
+    if price <= 0:
+        return "Engine has no price yet. Try again in a few seconds."
+
+    if usd_amount <= 0:
+        return "Amount must be > 0. Example: /logbuy 100"
+
+    qty = usd_amount / price
+
+    if side == "BUY":
+        manual_state["qty_btc"] += qty
+        manual_state["cost_basis_usd"] += usd_amount
+        manual_state["trades"].append({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "side": "BUY",
+            "usd": round(usd_amount, 2),
+            "price": round(price, 2),
+            "qty_btc": qty,
+        })
+        atomic_write_json(MANUAL_FILE, manual_state)
+        return f"✅ Logged BUY ${usd_amount:.2f} @ ${price:,.2f} (≈ {qty:.8f} BTC)"
+
+    if side == "SELL":
+        if manual_state["qty_btc"] <= 0:
+            return "You have 0 BTC logged. Use /logbuy first."
+
+        sell_qty = min(qty, manual_state["qty_btc"])
+        # avg cost method
+        avg_cost = (manual_state["cost_basis_usd"] / manual_state["qty_btc"]) if manual_state["qty_btc"] > 0 else 0
+        cost_sold = avg_cost * sell_qty
+        proceeds = sell_qty * price
+        pnl = proceeds - cost_sold
+
+        manual_state["qty_btc"] -= sell_qty
+        manual_state["cost_basis_usd"] -= cost_sold
+        manual_state["realized_pl_usd"] += pnl
+        manual_state["trades"].append({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "side": "SELL",
+            "usd": round(proceeds, 2),
+            "price": round(price, 2),
+            "qty_btc": sell_qty,
+            "pnl_usd": round(pnl, 2),
+        })
+        atomic_write_json(MANUAL_FILE, manual_state)
+        return f"✅ Logged SELL ≈${proceeds:.2f} @ ${price:,.2f} (P/L {pnl:+.2f})"
+
+    return "Unknown trade side."
+
+def telegram_poll_loop():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    telegram_delete_webhook()
+    offset = 0
+
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"timeout": 50, "offset": offset},
+                timeout=60,
+            )
+            data = resp.json()
+            results = data.get("result", [])
+
+            for upd in results:
+                offset = max(offset, int(upd.get("update_id", 0)) + 1)
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg:
+                    continue
+
+                chat_id = str(msg.get("chat", {}).get("id", "")).strip()
+                text = (msg.get("text") or "").strip()
+
+                # only respond to your configured chat
+                if chat_id != TELEGRAM_CHAT_ID:
+                    continue
+
+                if text.startswith("/status"):
+                    send_telegram(build_status_text())
+
+                elif text.startswith("/logbuy"):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        send_telegram("Usage: /logbuy 100")
+                    else:
+                        try:
+                            amt = float(parts[1])
+                            send_telegram(handle_manual_trade("BUY", amt))
+                        except:
+                            send_telegram("Usage: /logbuy 100")
+
+                elif text.startswith("/logsell"):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        send_telegram("Usage: /logsell 100")
+                    else:
+                        try:
+                            amt = float(parts[1])
+                            send_telegram(handle_manual_trade("SELL", amt))
+                        except:
+                            send_telegram("Usage: /logsell 100")
+
+        except:
+            pass
+
+        time.sleep(1)
 
 # =========================
-# MARKET DATA + SIGNALS
+# MARKET DATA / SIGNALS
 # =========================
 def fetch_candles(limit=60):
     url = f"{COINBASE_BASE}/products/{PRODUCT}/candles"
     resp = requests.get(
         url,
         params={"granularity": GRANULARITY},
-        headers={"Accept": "application/json", "User-Agent": "btc-engine"},
+        headers={"Accept": "application/json", "User-Agent": "btc-alerts"},
         timeout=10,
     )
     data = resp.json()
     if not isinstance(data, list):
         raise RuntimeError(f"Coinbase API error: {data}")
 
-    # Coinbase returns newest-first; sort oldest->newest
     data.sort(key=lambda x: x[0])
     data = data[-limit:]
 
@@ -151,25 +294,21 @@ def fetch_candles(limit=60):
     closes = []
     for c in data:
         ts = int(c[0])
-        low = float(c[1])
-        high = float(c[2])
-        open_ = float(c[3])
-        close = float(c[4])
-
         candles.append({
             "time": datetime.fromtimestamp(ts).strftime("%H:%M"),
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
+            "open": float(c[3]),
+            "high": float(c[2]),
+            "low": float(c[1]),
+            "close": float(c[4]),
         })
-        closes.append(close)
+        closes.append(float(c[4]))
 
     return candles, closes
 
 def compute_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50.0
+
     deltas = np.diff(prices)
     gains = np.maximum(deltas, 0)
     losses = -np.minimum(deltas, 0)
@@ -185,7 +324,6 @@ def compute_rsi(prices, period=14):
 
 def confidence_score(rsi, trend_strength, momentum):
     score = 0
-
     if rsi < 30 or rsi > 70:
         score += 35
     elif 35 <= rsi <= 65:
@@ -193,286 +331,53 @@ def confidence_score(rsi, trend_strength, momentum):
 
     score += min(abs(momentum) * 2000, 25)
     score += min(trend_strength * 2000, 25)
-
     return max(0, min(100, int(score)))
 
+def update_paper(signal: str, confidence: int, price: float):
+    if price <= 0:
+        return
 
-# =========================
-# PAPER + REAL P/L
-# =========================
-def compute_portfolio_snapshot(port, price):
-    cash = float(port.get("cash", 0.0))
-    btc = float(port.get("btc", 0.0))
-    equity = cash + btc * price
-    cost_basis = float(port.get("cost_basis", 0.0))
-    realized = float(port.get("realized_pl", 0.0))
+    # only take paper actions when confidence is decent
+    if confidence < PAPER_MIN_CONFIDENCE:
+        return
 
-    unrealized = 0.0
-    if btc > 0 and cost_basis > 0:
-        avg_cost = cost_basis / btc
-        unrealized = (price - avg_cost) * btc
-
-    total_pl = realized + unrealized
-    return {
-        "cash": round(cash, 2),
-        "btc": round(btc, 8),
-        "equity": round(equity, 2),
-        "cost_basis": round(cost_basis, 2),
-        "realized_pl": round(realized, 2),
-        "unrealized_pl": round(unrealized, 2),
-        "total_pl": round(total_pl, 2),
-    }
-
-def paper_trade_logic(signal_state, confidence, price):
-    """Simple paper strategy: BUY = all-in, SELL = all-out."""
-    with persist_lock:
-        p = PERSIST["paper"]
-        now = time.time()
-
-        if now - float(p.get("last_trade_ts", 0.0)) < ALERT_COOLDOWN:
-            return
-
-        if signal_state == "BUY" and confidence >= MIN_CONFIDENCE and p["cash"] > 1:
-            usd = p["cash"]
-            btc = usd / price
-            p["cash"] -= usd
-            p["btc"] += btc
-            p["cost_basis"] += usd
-            p["last_trade_ts"] = now
-
-            PERSIST["trades"]["paper"].append({
-                "time": now_str(),
-                "side": "BUY",
-                "usd": round(usd, 2),
-                "btc": round(btc, 8),
-                "price": round(price, 2),
-            })
-
-        elif signal_state == "SELL" and confidence >= MIN_CONFIDENCE and p["btc"] > 0:
-            btc = p["btc"]
-            proceeds = btc * price
-
-            avg_cost = (p["cost_basis"] / btc) if btc > 0 else price
-            realized = (price - avg_cost) * btc
-
-            p["cash"] += proceeds
-            p["btc"] = 0.0
-            p["cost_basis"] = 0.0
-            p["realized_pl"] += realized
-            p["last_trade_ts"] = now
-
-            PERSIST["trades"]["paper"].append({
-                "time": now_str(),
-                "side": "SELL",
-                "usd": round(proceeds, 2),
-                "btc": round(btc, 8),
-                "price": round(price, 2),
-                "realized_pl": round(realized, 2),
-            })
-
-def real_log_buy(usd, price):
-    with persist_lock:
-        r = PERSIST["real"]
-        usd = float(usd)
-        btc = usd / price
-
-        r["cash"] -= usd
-        r["btc"] += btc
-        r["cost_basis"] += usd
-
-        PERSIST["trades"]["real"].append({
-            "time": now_str(),
+    if signal == "BUY" and paper_state["qty_btc"] <= 0 and paper_state["cash_usd"] > 0:
+        qty = paper_state["cash_usd"] / price
+        paper_state["qty_btc"] = qty
+        paper_state["entry_price"] = price
+        paper_state["trades"].append({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "side": "BUY",
-            "usd": round(usd, 2),
-            "btc": round(btc, 8),
             "price": round(price, 2),
+            "qty_btc": qty,
         })
+        paper_state["cash_usd"] = 0.0
+        atomic_write_json(PAPER_FILE, paper_state)
 
-def real_log_sell(usd, price):
-    with persist_lock:
-        r = PERSIST["real"]
-        usd = float(usd)
+    elif signal == "SELL" and paper_state["qty_btc"] > 0:
+        qty = paper_state["qty_btc"]
+        entry = float(paper_state["entry_price"] or price)
+        proceeds = qty * price
+        pnl = (price - entry) * qty
 
-        if r["btc"] <= 0:
-            return False, "You have 0 BTC logged in real trades."
-
-        btc_to_sell = usd / price
-        if btc_to_sell > r["btc"]:
-            btc_to_sell = r["btc"]
-            usd = btc_to_sell * price
-
-        avg_cost = (r["cost_basis"] / r["btc"]) if r["btc"] > 0 and r["cost_basis"] > 0 else price
-        realized = (price - avg_cost) * btc_to_sell
-
-        r["btc"] -= btc_to_sell
-        r["cash"] += usd
-        r["cost_basis"] -= avg_cost * btc_to_sell
-        r["realized_pl"] += realized
-
-        if r["btc"] < 1e-12:
-            r["btc"] = 0.0
-            r["cost_basis"] = 0.0
-
-        PERSIST["trades"]["real"].append({
-            "time": now_str(),
+        paper_state["cash_usd"] = proceeds
+        paper_state["qty_btc"] = 0.0
+        paper_state["entry_price"] = None
+        paper_state["realized_pl_usd"] += pnl
+        paper_state["trades"].append({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "side": "SELL",
-            "usd": round(usd, 2),
-            "btc": round(btc_to_sell, 8),
             "price": round(price, 2),
-            "realized_pl": round(realized, 2),
+            "qty_btc": qty,
+            "pnl_usd": round(pnl, 2),
         })
-        return True, None
-
-
-# =========================
-# TELEGRAM COMMANDS
-# =========================
-def format_status():
-    with state_lock:
-        s = dict(STATE)
-
-    price = s.get("price", 0.0)
-    rsi = s.get("rsi", 0.0)
-    trend = s.get("trend", "WAIT")
-    conf = s.get("confidence", 0)
-    mom = s.get("momentum", 0.0)
-    t = s.get("time", "--:--:--")
-
-    paper = s.get("paper", {})
-    real = s.get("real", {})
-
-    up = int(time.time() - PERSIST["engine"]["started_at"])
-    return (
-        f"📊 BTC Engine Status\n"
-        f"Price: ${price:,.2f}\n"
-        f"RSI(1m): {rsi}\n"
-        f"Momentum(~5m): {mom:+.5f}\n"
-        f"Signal: {trend} | Confidence: {conf}%\n"
-        f"Last update: {t}\n"
-        f"\n🧪 Paper\n"
-        f"Equity: ${paper.get('equity', 0):,.2f}\n"
-        f"P/L: ${paper.get('total_pl', 0):,.2f} (R {paper.get('realized_pl', 0):,.2f} / U {paper.get('unrealized_pl', 0):,.2f})\n"
-        f"\n🧾 Real (logged)\n"
-        f"Equity: ${real.get('equity', 0):,.2f}\n"
-        f"P/L: ${real.get('total_pl', 0):,.2f} (R {real.get('realized_pl', 0):,.2f} / U {real.get('unrealized_pl', 0):,.2f})\n"
-        f"\n⏱ Uptime: {up//3600}h {(up%3600)//60}m"
-    )
-
-async def telegram_loop():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
-    offset = int(PERSIST.get("telegram", {}).get("offset", 0))
-
-    while True:
-        try:
-            r = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                params={"timeout": 30, "offset": offset},
-                timeout=35,
-            )
-            data = r.json()
-            if not data.get("ok"):
-                await asyncio.sleep(2)
-                continue
-
-            for upd in data.get("result", []):
-                offset = max(offset, int(upd.get("update_id", 0)) + 1)
-
-                msg = upd.get("message") or upd.get("edited_message")
-                if not msg:
-                    continue
-
-                chat_id = str((msg.get("chat") or {}).get("id", ""))
-                if chat_id != TELEGRAM_CHAT_ID:
-                    continue
-
-                text = (msg.get("text") or "").strip()
-                if not text.startswith("/"):
-                    continue
-
-                parts = text.split()
-                cmd = parts[0].lower()
-
-                with state_lock:
-                    price = float(STATE.get("price", 0.0))
-
-                if cmd in ("/help", "/start"):
-                    send_telegram(
-                        "Commands:\n"
-                        "/status\n"
-                        "/logbuy <usd>\n"
-                        "/logsell <usd>\n"
-                        "Example: /logbuy 100"
-                    )
-
-                elif cmd == "/status":
-                    send_telegram(format_status())
-
-                elif cmd == "/logbuy":
-                    if len(parts) != 2:
-                        send_telegram("Usage: /logbuy 100")
-                    else:
-                        try:
-                            usd = float(parts[1])
-                            if usd <= 0:
-                                raise ValueError()
-                            if price <= 0:
-                                send_telegram("Price not ready yet — try again in a few seconds.")
-                            else:
-                                real_log_buy(usd, price)
-                                atomic_write_json(PERSIST_FILE, PERSIST)
-                                send_telegram(f"✅ Logged REAL BUY ${usd:,.2f} @ ${price:,.2f}")
-                        except:
-                            send_telegram("Usage: /logbuy 100")
-
-                elif cmd == "/logsell":
-                    if len(parts) != 2:
-                        send_telegram("Usage: /logsell 100")
-                    else:
-                        try:
-                            usd = float(parts[1])
-                            if usd <= 0:
-                                raise ValueError()
-                            if price <= 0:
-                                send_telegram("Price not ready yet — try again in a few seconds.")
-                            else:
-                                ok, err = real_log_sell(usd, price)
-                                if not ok:
-                                    send_telegram(f"❌ {err}")
-                                else:
-                                    atomic_write_json(PERSIST_FILE, PERSIST)
-                                    send_telegram(f"✅ Logged REAL SELL ${usd:,.2f} @ ${price:,.2f}")
-                        except:
-                            send_telegram("Usage: /logsell 100")
-
-            PERSIST["telegram"]["offset"] = offset
-            atomic_write_json(PERSIST_FILE, PERSIST)
-
-        except:
-            pass
-
-        await asyncio.sleep(2)
-
-async def heartbeat_loop():
-    if HEARTBEAT_MINUTES <= 0:
-        return
-    while True:
-        try:
-            send_telegram("💚 Heartbeat\n" + format_status())
-        except:
-            pass
-        await asyncio.sleep(HEARTBEAT_MINUTES * 60)
-
+        atomic_write_json(PAPER_FILE, paper_state)
 
 # =========================
-# HTTP SERVER: /state
+# HTTP API (for UI)
 # =========================
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
 class Handler(BaseHTTPRequestHandler):
-    def _send_json(self, obj, code=200):
+    def _json(self, code: int, obj: dict):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -483,115 +388,135 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
 
-        if path in ("/health", "/"):
-            return self._send_json({"ok": True, "time": now_str()})
+        if path == "/health":
+            return self._json(200, {"ok": True})
 
         if path == "/state":
             with state_lock:
-                s = dict(STATE)
-            return self._send_json(s)
+                s = dict(latest_state)
 
-        return self._send_json({"error": "not found"}, code=404)
+            # attach paper + manual summaries for UI
+            price = float(s.get("price", 0) or 0)
+            p_equity = paper_state["cash_usd"] + paper_state["qty_btc"] * price
+            p_unreal = 0.0
+            if paper_state.get("entry_price") and paper_state["qty_btc"] > 0:
+                p_unreal = (price - float(paper_state["entry_price"])) * paper_state["qty_btc"]
 
-def start_http_server():
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    server.serve_forever()
+            m_unreal = (manual_state["qty_btc"] * price) - manual_state["cost_basis_usd"]
+            m_total = manual_state["realized_pl_usd"] + m_unreal
 
+            s["paper"] = {
+                "cash_usd": paper_state["cash_usd"],
+                "qty_btc": paper_state["qty_btc"],
+                "equity_usd": p_equity,
+                "realized_pl_usd": paper_state["realized_pl_usd"],
+                "unrealized_pl_usd": p_unreal,
+                "last_trade": paper_state["trades"][-1] if paper_state["trades"] else None,
+            }
+            s["manual"] = {
+                "qty_btc": manual_state["qty_btc"],
+                "cost_basis_usd": manual_state["cost_basis_usd"],
+                "realized_pl_usd": manual_state["realized_pl_usd"],
+                "unrealized_pl_usd": m_unreal,
+                "total_pl_usd": m_total,
+                "last_trade": manual_state["trades"][-1] if manual_state["trades"] else None,
+            }
+
+            return self._json(200, s)
+
+        return self._json(404, {"error": "Not found"})
 
 # =========================
-# ENGINE LOOP
+# MAIN LOOP
 # =========================
-async def engine_loop():
-    last_alert_ts = 0.0
-    print("✅ BTC Engine running")
+async def main_loop():
+    last_alert = 0.0
+    last_heartbeat = 0.0
+
+    # startup msg once (if configured)
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        send_telegram("✅ BTC AI bot started. Use /status anytime.")
 
     while True:
         try:
             candles, closes = fetch_candles(limit=60)
             price = float(closes[-1])
-            rsi = float(compute_rsi(closes, period=14))
+            rsi = float(compute_rsi(closes))
 
-            momentum = (closes[-1] - closes[-5]) / closes[-5] if len(closes) >= 6 else 0.0
+            momentum = 0.0
+            if len(closes) >= 6 and closes[-5] != 0:
+                momentum = (closes[-1] - closes[-5]) / closes[-5]
+
             trend_strength = abs(momentum)
 
-            trend = "WAIT"
-            signal_state = "WAIT"
-
-            if (rsi < 30) and (momentum > 0):
-                trend = signal_state = "BUY"
-            elif (rsi > 70) and (momentum < 0):
-                trend = signal_state = "SELL"
+            signal = "WAIT"
+            if rsi < 30 and momentum > 0:
+                signal = "BUY"
+            elif rsi > 70 and momentum < 0:
+                signal = "SELL"
 
             confidence = confidence_score(rsi, trend_strength, momentum)
 
-            paper_trade_logic(signal_state, confidence, price)
-
-            with persist_lock:
-                paper_snap = compute_portfolio_snapshot(PERSIST["paper"], price)
-                real_snap = compute_portfolio_snapshot(PERSIST["real"], price)
-                paper_trades = PERSIST["trades"]["paper"][-20:]
-                real_trades = PERSIST["trades"]["real"][-20:]
-
             with state_lock:
-                STATE.update({
+                latest_state.update({
                     "price": round(price, 2),
                     "rsi": round(rsi, 1),
-                    "trend": trend,
-                    "state": signal_state,
+                    "trend": signal if signal != "WAIT" else "WAIT",
+                    "state": signal if signal != "WAIT" else "WAIT",
+                    "signal": signal,
                     "confidence": int(confidence),
                     "momentum": float(momentum),
-                    "time": now_str(),
+                    "time": datetime.now().strftime("%H:%M:%S"),
                     "candles": candles[-30:],
-                    "notes": f"src=Coinbase • momentum={momentum:+.5f}",
+                    "notes": f"src=Coinbase • momentum={momentum:.5f}",
                     "error": "",
-                    "paper": paper_snap,
-                    "real": real_snap,
-                    "trades": {"paper": paper_trades, "real": real_trades},
                 })
 
+            atomic_write_json(STATE_FILE, latest_state)
+
+            # paper sim
+            update_paper(signal, confidence, price)
+
+            # real alerts (filtered)
             now = time.time()
-            if (
-                signal_state in ("BUY", "SELL")
-                and confidence >= MIN_CONFIDENCE
-                and (now - last_alert_ts) > ALERT_COOLDOWN
-            ):
+            if signal in ["BUY", "SELL"] and confidence >= MIN_CONFIDENCE and (now - last_alert) > ALERT_COOLDOWN:
                 send_telegram(
-                    f"📢 BTC {signal_state} ALERT\n"
+                    f"📢 BTC {signal} ALERT\n"
                     f"Price: ${price:,.2f}\n"
                     f"RSI(1m): {round(rsi,1)}\n"
                     f"Confidence: {confidence}%\n"
-                    f"Momentum(~5m): {momentum:+.5f}"
+                    f"Momentum(5m): {momentum:+.4f}"
                 )
-                last_alert_ts = now
+                last_alert = now
 
-            with persist_lock:
-                atomic_write_json(PERSIST_FILE, PERSIST)
-            atomic_write_json(STATE_FILE, STATE)
+            # heartbeat (to prove it's alive)
+            if HEARTBEAT_SECONDS > 0 and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                if (now - last_heartbeat) > HEARTBEAT_SECONDS:
+                    send_telegram(f"💓 Heartbeat: ${price:,.2f} | RSI {round(rsi,1)} | {signal} | conf {confidence}%")
+                    last_heartbeat = now
 
         except Exception as e:
             with state_lock:
-                STATE["error"] = str(e)
-                STATE["time"] = now_str()
-            atomic_write_json(STATE_FILE, STATE)
+                latest_state.update({
+                    "error": str(e),
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                })
+            atomic_write_json(STATE_FILE, latest_state)
 
-        await asyncio.sleep(ENGINE_TICK_SECONDS)
+        await asyncio.sleep(ENGINE_INTERVAL_SECONDS)
 
-async def main():
-    loaded = safe_load_json(PERSIST_FILE, None)
-    if isinstance(loaded, dict):
-        with persist_lock:
-            PERSIST.update(loaded)
-
-    threading.Thread(target=start_http_server, daemon=True).start()
-
-    if STARTUP_MESSAGE and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        send_telegram("✅ BTC engine is live. Use /status, /logbuy 100, /logsell 100")
-
-    await asyncio.gather(
-        engine_loop(),
-        telegram_loop(),
-        heartbeat_loop(),
-    )
+def run_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server.serve_forever()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # HTTP server thread (for /state)
+    t = threading.Thread(target=run_http_server, daemon=True)
+    t.start()
+
+    # Telegram command poll thread
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        tp = threading.Thread(target=telegram_poll_loop, daemon=True)
+        tp.start()
+
+    asyncio.run(main_loop())
