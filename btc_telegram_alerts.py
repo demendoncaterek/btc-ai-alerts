@@ -4,85 +4,105 @@ import os
 import time
 import threading
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
 
 import numpy as np
 import requests
 
 # =========================
-# CONFIG (env override)
+# CONFIG
 # =========================
-PRODUCT = os.getenv("PRODUCT", "BTC-USD")
-GRANULARITY = int(os.getenv("GRANULARITY", "60"))  # 60s candles
-STATE_FILE = os.getenv("STATE_FILE", "btc_state.json")
-
-# Trading state for UI + paper trading
-TRADE_FILE = os.getenv("TRADE_FILE", "btc_trades.json")
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # string is fine
-
+PRODUCT = "BTC-USD"
+GRANULARITY = 60  # 1-minute candles
 COINBASE_BASE = "https://api.exchange.coinbase.com"
 
-ENGINE_LOOP_SECS = int(os.getenv("ENGINE_LOOP_SECS", "5"))
+STATE_FILE = "btc_state.json"          # optional debug file
+PERSIST_FILE = "trade_state.json"      # stores paper + real trade logs
 
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "300"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
+ENGINE_TICK_SECONDS = 5                # how often engine updates the state
 
-# Heartbeat (optional): 0 = off (recommended). Set e.g. 3600 for hourly.
-HEARTBEAT_SECS = int(os.getenv("HEARTBEAT_SECS", "0"))
+ALERT_COOLDOWN = 300                   # seconds
+MIN_CONFIDENCE = 70                    # only high-quality alerts
 
-# Paper trading defaults (SAFE)
-TRADE_MODE = os.getenv("TRADE_MODE", "paper").lower()  # "paper" (default), "live" (not implemented)
-STARTING_CASH = float(os.getenv("STARTING_CASH", "1000"))
-TRADE_FRACTION = float(os.getenv("TRADE_FRACTION", "1.0"))  # 1.0 = use all cash on buy
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+
+# Heartbeat (optional): 0 disables
+HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "0"))  # e.g. 60 for hourly
+
+# Paper trading
+PAPER_START_CASH = float(os.getenv("PAPER_START_CASH", "10000"))
+
+# HTTP server
+PORT = int(os.getenv("PORT", "8000"))
 
 # =========================
-# INTERNAL STATE
+# GLOBAL STATE (thread-safe)
 # =========================
-LATEST_STATE: Dict[str, Any] = {}
-LAST_ALERT_TS = 0.0
-LAST_HEARTBEAT_TS = 0.0
+state_lock = threading.Lock()
 
-TRADE_STATE: Dict[str, Any] = {
-    "enabled": False,
-    "mode": TRADE_MODE,          # paper/live
-    "cash_usd": STARTING_CASH,
-    "btc_qty": 0.0,
-    "entry_price": 0.0,
-    "realized_pnl": 0.0,
-    "unrealized_pnl": 0.0,
-    "equity_usd": STARTING_CASH,
-    "last_trade": None,
-    "trades": [],               # list of trades for UI markers
-    "updated_at": None,
+STATE = {
+    "price": 0.0,
+    "rsi": 0.0,
+    "trend": "WAIT",
+    "state": "WAIT",
+    "confidence": 0,
+    "momentum": 0.0,
+    "time": "--:--:--",
+    "candles": [],
+    "notes": "",
+    "error": "",
+    "paper": {},
+    "real": {},
+    "trades": {"paper": [], "real": []},
 }
 
-# Telegram polling offset (kept in memory; fine for most cases)
-TG_OFFSET = 0
+PERSIST = {
+    "paper": {
+        "start_cash": PAPER_START_CASH,
+        "cash": PAPER_START_CASH,
+        "btc": 0.0,
+        "cost_basis": 0.0,          # total USD spent on current holdings
+        "realized_pl": 0.0,
+        "last_trade_ts": 0.0,
+    },
+    "real": {
+        "cash": 0.0,                # purely tracked from your /log commands
+        "btc": 0.0,
+        "cost_basis": 0.0,
+        "realized_pl": 0.0,
+    },
+    "trades": {"paper": [], "real": []},
+    "telegram": {"offset": 0},
+    "engine": {"started_at": time.time()},
+}
 
 # =========================
-# HELPERS
+# UTIL
 # =========================
-def atomic_write_json(path: str, obj: dict):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False)
-    os.replace(tmp, path)
+def now_str():
+    return datetime.now().strftime("%H:%M:%S")
 
-
-def safe_load_json(path: str) -> Optional[dict]:
-    if not os.path.exists(path):
-        return None
+def safe_load_json(path, default):
     try:
+        if not os.path.exists(path):
+            return default
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read().strip()
-            if not raw:
-                return None
-            return json.loads(raw)
+        if not raw:
+            return default
+        return json.loads(raw)
     except:
-        return None
+        return default
 
+def atomic_write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
 
 def send_telegram(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -96,47 +116,48 @@ def send_telegram(msg: str):
     except:
         pass
 
-
+# =========================
+# MARKET DATA + SIGNALS
+# =========================
 def fetch_candles(limit=60):
     url = f"{COINBASE_BASE}/products/{PRODUCT}/candles"
     resp = requests.get(
         url,
         params={"granularity": GRANULARITY},
-        headers={"Accept": "application/json", "User-Agent": "btc-alerts"},
+        headers={"Accept": "application/json", "User-Agent": "btc-engine"},
         timeout=10,
     )
     data = resp.json()
     if not isinstance(data, list):
         raise RuntimeError(f"Coinbase API error: {data}")
 
+    # Coinbase returns newest-first; sort oldest->newest
     data.sort(key=lambda x: x[0])
     data = data[-limit:]
 
     candles = []
     closes = []
-
     for c in data:
         ts = int(c[0])
-        dt = datetime.fromtimestamp(ts)
-        candles.append(
-            {
-                "ts": ts,
-                "time": dt.strftime("%H:%M"),
-                "open": float(c[3]),
-                "high": float(c[2]),
-                "low": float(c[1]),
-                "close": float(c[4]),
-            }
-        )
-        closes.append(float(c[4]))
+        low = float(c[1])
+        high = float(c[2])
+        open_ = float(c[3])
+        close = float(c[4])
+
+        candles.append({
+            "time": datetime.fromtimestamp(ts).strftime("%H:%M"),
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+        })
+        closes.append(close)
 
     return candles, closes
-
 
 def compute_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50.0
-
     deltas = np.diff(prices)
     gains = np.maximum(deltas, 0)
     losses = -np.minimum(deltas, 0)
@@ -150,321 +171,420 @@ def compute_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-
 def confidence_score(rsi, trend_strength, momentum):
     score = 0
 
-    # RSI extremes help; mid-range hurts
+    # extremes help confidence
     if rsi < 30 or rsi > 70:
         score += 35
     elif 35 <= rsi <= 65:
         score -= 10
 
-    # momentum + trend strength scale-in
     score += min(abs(momentum) * 2000, 25)
     score += min(trend_strength * 2000, 25)
 
     return max(0, min(100, int(score)))
 
+# =========================
+# PAPER + REAL P/L
+# =========================
+def compute_portfolio_snapshot(port, price):
+    cash = float(port.get("cash", 0.0))
+    btc = float(port.get("btc", 0.0))
+    equity = cash + btc * price
+    cost_basis = float(port.get("cost_basis", 0.0))
+    realized = float(port.get("realized_pl", 0.0))
 
-def trade_equity(price: float) -> float:
-    return float(TRADE_STATE["cash_usd"]) + float(TRADE_STATE["btc_qty"]) * price
+    # unrealized based on avg cost
+    unrealized = 0.0
+    if btc > 0 and cost_basis > 0:
+        avg_cost = cost_basis / btc
+        unrealized = (price - avg_cost) * btc
 
-
-def record_trade(side: str, price: float, qty: float, pnl: float):
-    t = {
-        "ts": int(time.time()),
-        "time": datetime.now().strftime("%H:%M:%S"),
-        "side": side,  # BUY / SELL
-        "price": round(price, 2),
-        "qty": qty,
-        "pnl": round(pnl, 2),
+    total_pl = realized + unrealized
+    return {
+        "cash": round(cash, 2),
+        "btc": round(btc, 8),
+        "equity": round(equity, 2),
+        "cost_basis": round(cost_basis, 2),
+        "realized_pl": round(realized, 2),
+        "unrealized_pl": round(unrealized, 2),
+        "total_pl": round(total_pl, 2),
     }
-    TRADE_STATE["trades"].append(t)
-    # keep last 200
-    TRADE_STATE["trades"] = TRADE_STATE["trades"][-200:]
-    TRADE_STATE["last_trade"] = t
 
+def paper_trade_logic(signal_state, confidence, price):
+    """Simple paper strategy: BUY = all-in, SELL = all-out."""
+    p = PERSIST["paper"]
+    now = time.time()
 
-def maybe_paper_trade(signal: str, price: float, confidence: int):
-    """
-    Paper trading:
-    - BUY: enter long using TRADE_FRACTION of cash if flat
-    - SELL: exit full position if long
-    Only runs if /starttrade enabled AND confidence >= MIN_CONFIDENCE
-    """
-    if not TRADE_STATE["enabled"]:
-        return
-    if confidence < MIN_CONFIDENCE:
+    if now - float(p.get("last_trade_ts", 0.0)) < ALERT_COOLDOWN:
         return
 
-    cash = float(TRADE_STATE["cash_usd"])
-    btc = float(TRADE_STATE["btc_qty"])
-    entry = float(TRADE_STATE["entry_price"])
+    if signal_state == "BUY" and confidence >= MIN_CONFIDENCE and p["cash"] > 1:
+        usd = p["cash"]
+        btc = usd / price
+        p["cash"] -= usd
+        p["btc"] += btc
+        p["cost_basis"] += usd
+        p["last_trade_ts"] = now
 
-    if signal == "BUY" and btc <= 0:
-        spend = cash * max(0.0, min(TRADE_FRACTION, 1.0))
-        if spend <= 1:
-            return
-        qty = spend / price
-        TRADE_STATE["cash_usd"] = cash - spend
-        TRADE_STATE["btc_qty"] = qty
-        TRADE_STATE["entry_price"] = price
-        record_trade("BUY", price, qty, 0.0)
-        send_telegram(
-            f"🟢 PAPER BUY\nPrice: ${price:,.2f}\nQty: {qty:.8f} BTC\nConfidence: {confidence}%"
-        )
+        PERSIST["trades"]["paper"].append({
+            "time": now_str(),
+            "side": "BUY",
+            "usd": round(usd, 2),
+            "btc": round(btc, 8),
+            "price": round(price, 2),
+        })
 
-    elif signal == "SELL" and btc > 0:
+    elif signal_state == "SELL" and confidence >= MIN_CONFIDENCE and p["btc"] > 0:
+        btc = p["btc"]
         proceeds = btc * price
-        cost = btc * entry
-        pnl = proceeds - cost
-        TRADE_STATE["cash_usd"] = cash + proceeds
-        TRADE_STATE["btc_qty"] = 0.0
-        TRADE_STATE["entry_price"] = 0.0
-        TRADE_STATE["realized_pnl"] = float(TRADE_STATE["realized_pnl"]) + pnl
-        record_trade("SELL", price, btc, pnl)
-        send_telegram(
-            f"🔴 PAPER SELL\nPrice: ${price:,.2f}\nPnL: ${pnl:,.2f}\nConfidence: {confidence}%"
-        )
 
+        avg_cost = (p["cost_basis"] / btc) if btc > 0 else price
+        realized = (price - avg_cost) * btc
 
-def update_trade_metrics(price: float):
-    btc = float(TRADE_STATE["btc_qty"])
-    entry = float(TRADE_STATE["entry_price"])
-    unreal = 0.0
-    if btc > 0 and entry > 0:
-        unreal = btc * (price - entry)
+        p["cash"] += proceeds
+        p["btc"] = 0.0
+        p["cost_basis"] = 0.0
+        p["realized_pl"] += realized
+        p["last_trade_ts"] = now
 
-    TRADE_STATE["unrealized_pnl"] = unreal
-    TRADE_STATE["equity_usd"] = trade_equity(price)
-    TRADE_STATE["updated_at"] = datetime.now().strftime("%H:%M:%S")
+        PERSIST["trades"]["paper"].append({
+            "time": now_str(),
+            "side": "SELL",
+            "usd": round(proceeds, 2),
+            "btc": round(btc, 8),
+            "price": round(price, 2),
+            "realized_pl": round(realized, 2),
+        })
 
+def real_log_buy(usd, price):
+    r = PERSIST["real"]
+    usd = float(usd)
+    btc = usd / price
 
-def persist_trade_state():
-    atomic_write_json(TRADE_FILE, TRADE_STATE)
+    r["cash"] -= usd
+    r["btc"] += btc
+    r["cost_basis"] += usd
 
+    PERSIST["trades"]["real"].append({
+        "time": now_str(),
+        "side": "BUY",
+        "usd": round(usd, 2),
+        "btc": round(btc, 8),
+        "price": round(price, 2),
+    })
+
+def real_log_sell(usd, price):
+    r = PERSIST["real"]
+    usd = float(usd)
+
+    if r["btc"] <= 0:
+        return False, "You have 0 BTC logged in real trades."
+
+    btc_to_sell = usd / price
+    if btc_to_sell > r["btc"]:
+        btc_to_sell = r["btc"]
+        usd = btc_to_sell * price
+
+    avg_cost = (r["cost_basis"] / r["btc"]) if r["btc"] > 0 and r["cost_basis"] > 0 else price
+    realized = (price - avg_cost) * btc_to_sell
+
+    r["btc"] -= btc_to_sell
+    r["cash"] += usd
+    r["cost_basis"] -= avg_cost * btc_to_sell
+    r["realized_pl"] += realized
+
+    # clean tiny floats
+    if r["btc"] < 1e-12:
+        r["btc"] = 0.0
+        r["cost_basis"] = 0.0
+
+    PERSIST["trades"]["real"].append({
+        "time": now_str(),
+        "side": "SELL",
+        "usd": round(usd, 2),
+        "btc": round(btc_to_sell, 8),
+        "price": round(price, 2),
+        "realized_pl": round(realized, 2),
+    })
+    return True, None
 
 # =========================
-# TELEGRAM COMMANDS (polling)
+# TELEGRAM COMMANDS
 # =========================
-def telegram_get_updates(timeout_s=25):
-    global TG_OFFSET
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"timeout": timeout_s, "offset": TG_OFFSET + 1}
-    r = requests.get(url, params=params, timeout=timeout_s + 5)
-    return r.json()
+def format_status():
+    with state_lock:
+        s = dict(STATE)
+    price = s.get("price", 0.0)
+    rsi = s.get("rsi", 0.0)
+    trend = s.get("trend", "WAIT")
+    conf = s.get("confidence", 0)
+    mom = s.get("momentum", 0.0)
+    t = s.get("time", "--:--:--")
 
+    paper = s.get("paper", {})
+    real = s.get("real", {})
 
-def handle_command(text: str, chat_id: str):
-    text = (text or "").strip().lower()
+    up = int(time.time() - PERSIST["engine"]["started_at"])
+    return (
+        f"📊 BTC Engine Status\n"
+        f"Price: ${price:,.2f}\n"
+        f"RSI(1m): {rsi}\n"
+        f"Momentum(~5m): {mom:+.5f}\n"
+        f"Signal: {trend} | Confidence: {conf}%\n"
+        f"Last update: {t}\n"
+        f"\n🧪 Paper\n"
+        f"Equity: ${paper.get('equity', 0):,.2f}\n"
+        f"P/L: ${paper.get('total_pl', 0):,.2f} (R {paper.get('realized_pl', 0):,.2f} / U {paper.get('unrealized_pl', 0):,.2f})\n"
+        f"\n🧾 Real (logged)\n"
+        f"Equity: ${real.get('equity', 0):,.2f}\n"
+        f"P/L: ${real.get('total_pl', 0):,.2f} (R {real.get('realized_pl', 0):,.2f} / U {real.get('unrealized_pl', 0):,.2f})\n"
+        f"\n⏱ Uptime: {up//3600}h {(up%3600)//60}m"
+    )
 
-    if text in ("/help", "help"):
-        send_telegram(
-            "Commands:\n"
-            "/status - show engine + trading status\n"
-            "/starttrade - enable paper trading\n"
-            "/stoptrade - disable paper trading\n"
-        )
-        return
-
-    if text.startswith("/status"):
-        s = LATEST_STATE or {}
-        price = s.get("price", 0)
-        rsi = s.get("rsi", 0)
-        trend = s.get("trend", "WAIT")
-        conf = s.get("confidence", 0)
-        updated = s.get("time", "--:--:--")
-        enabled = "ON ✅" if TRADE_STATE["enabled"] else "OFF ⛔"
-        pos = "LONG" if float(TRADE_STATE["btc_qty"]) > 0 else "FLAT"
-        eq = float(TRADE_STATE.get("equity_usd", 0))
-        rpnl = float(TRADE_STATE.get("realized_pnl", 0))
-        upnl = float(TRADE_STATE.get("unrealized_pnl", 0))
-
-        send_telegram(
-            "📊 BTC STATUS\n"
-            f"Price: ${price:,.2f}\n"
-            f"RSI(1m): {rsi}\n"
-            f"Trend: {trend}\n"
-            f"Confidence: {conf}%\n"
-            f"Updated: {updated}\n\n"
-            f"Trading: {enabled} ({TRADE_STATE['mode']})\n"
-            f"Position: {pos}\n"
-            f"Equity: ${eq:,.2f}\n"
-            f"Realized PnL: ${rpnl:,.2f}\n"
-            f"Unrealized PnL: ${upnl:,.2f}"
-        )
-        return
-
-    if text.startswith("/starttrade"):
-        TRADE_STATE["enabled"] = True
-        persist_trade_state()
-        send_telegram("✅ Trading enabled (PAPER). I will only execute when Confidence >= MIN_CONFIDENCE.")
-        return
-
-    if text.startswith("/stoptrade"):
-        TRADE_STATE["enabled"] = False
-        persist_trade_state()
-        send_telegram("🛑 Trading disabled.")
-        return
-
-    # ignore other messages
-
-
-def telegram_poll_worker():
-    global TG_OFFSET
+async def telegram_loop():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    # Only respond to your configured chat id
-    allowed_chat = str(TELEGRAM_CHAT_ID)
+    # only allow messages from your chat id
+    offset = int(PERSIST.get("telegram", {}).get("offset", 0))
 
     while True:
         try:
-            data = telegram_get_updates(timeout_s=25)
+            r = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"timeout": 30, "offset": offset},
+                timeout=35,
+            )
+            data = r.json()
             if not data.get("ok"):
-                time.sleep(3)
+                await asyncio.sleep(2)
                 continue
 
             for upd in data.get("result", []):
-                TG_OFFSET = max(TG_OFFSET, upd.get("update_id", 0))
-                msg = upd.get("message") or {}
-                chat = msg.get("chat") or {}
-                chat_id = str(chat.get("id", ""))
+                offset = max(offset, int(upd.get("update_id", 0)) + 1)
 
-                if chat_id != allowed_chat:
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg:
                     continue
 
-                text = msg.get("text", "")
-                if text:
-                    handle_command(text, chat_id)
+                chat_id = str((msg.get("chat") or {}).get("id", ""))
+                if chat_id != TELEGRAM_CHAT_ID:
+                    continue
 
-        except Exception:
-            time.sleep(3)
+                text = (msg.get("text") or "").strip()
+                if not text.startswith("/"):
+                    continue
 
+                parts = text.split()
+                cmd = parts[0].lower()
 
-# =========================
-# STARTUP MESSAGE (only once per container)
-# =========================
-def send_startup_message_once():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+                # grab current price from STATE
+                with state_lock:
+                    price = float(STATE.get("price", 0.0))
+
+                if cmd in ("/help", "/start"):
+                    send_telegram(
+                        "Commands:\n"
+                        "/status\n"
+                        "/logbuy <usd>\n"
+                        "/logsell <usd>\n"
+                        "Example: /logbuy 100"
+                    )
+
+                elif cmd == "/status":
+                    send_telegram(format_status())
+
+                elif cmd == "/logbuy":
+                    if len(parts) != 2:
+                        send_telegram("Usage: /logbuy 100")
+                    else:
+                        try:
+                            usd = float(parts[1])
+                            if usd <= 0:
+                                raise ValueError()
+                            if price <= 0:
+                                send_telegram("Price not ready yet — try again in a few seconds.")
+                            else:
+                                real_log_buy(usd, price)
+                                atomic_write_json(PERSIST_FILE, PERSIST)
+                                send_telegram(f"✅ Logged REAL BUY ${usd:,.2f} @ ${price:,.2f}")
+                        except:
+                            send_telegram("Usage: /logbuy 100")
+
+                elif cmd == "/logsell":
+                    if len(parts) != 2:
+                        send_telegram("Usage: /logsell 100")
+                    else:
+                        try:
+                            usd = float(parts[1])
+                            if usd <= 0:
+                                raise ValueError()
+                            if price <= 0:
+                                send_telegram("Price not ready yet — try again in a few seconds.")
+                            else:
+                                ok, err = real_log_sell(usd, price)
+                                if not ok:
+                                    send_telegram(f"❌ {err}")
+                                else:
+                                    atomic_write_json(PERSIST_FILE, PERSIST)
+                                    send_telegram(f"✅ Logged REAL SELL ${usd:,.2f} @ ${price:,.2f}")
+                        except:
+                            send_telegram("Usage: /logsell 100")
+
+            PERSIST["telegram"]["offset"] = offset
+            atomic_write_json(PERSIST_FILE, PERSIST)
+
+        except:
+            pass
+
+        await asyncio.sleep(2)
+
+async def heartbeat_loop():
+    if HEARTBEAT_MINUTES <= 0:
         return
-    flag = "/tmp/btc_engine_startup_sent.flag"
-    if os.path.exists(flag):
-        return
-    send_telegram("✅ BTC AI bot is live and can send alerts.\nTip: send /status anytime.")
-    try:
-        with open(flag, "w") as f:
-            f.write("1")
-    except:
-        pass
-
+    while True:
+        try:
+            send_telegram("💚 Heartbeat\n" + format_status())
+        except:
+            pass
+        await asyncio.sleep(HEARTBEAT_MINUTES * 60)
 
 # =========================
-# MAIN LOOP
+# HTTP SERVER: /state
 # =========================
-async def main():
-    global LATEST_STATE, LAST_ALERT_TS, LAST_HEARTBEAT_TS
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
-    # load existing trade state if present (keeps your paper portfolio across restarts)
-    loaded_trade = safe_load_json(TRADE_FILE)
-    if isinstance(loaded_trade, dict):
-        TRADE_STATE.update(loaded_trade)
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, obj, code=200):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-    send_startup_message_once()
+    def do_GET(self):
+        path = urlparse(self.path).path
 
-    # start telegram polling thread
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        t = threading.Thread(target=telegram_poll_worker, daemon=True)
-        t.start()
+        if path in ("/health", "/"):
+            return self._send_json({"ok": True, "time": now_str()})
 
-    print("✅ BTC Alert Engine Running (AI-Filtered • Short-Term)")
+        if path == "/state":
+            with state_lock:
+                s = dict(STATE)
+            return self._send_json(s)
+
+        return self._send_json({"error": "not found"}, code=404)
+
+def start_http_server():
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.serve_forever()
+
+# =========================
+# ENGINE LOOP
+# =========================
+async def engine_loop():
+    last_alert_ts = 0.0
+
+    print("✅ BTC Engine running")
 
     while True:
         try:
             candles, closes = fetch_candles(limit=60)
-            price = closes[-1]
-            rsi = compute_rsi(closes)
+            price = float(closes[-1])
+            rsi = float(compute_rsi(closes, period=14))
 
+            # momentum over last ~5 mins
             momentum = (closes[-1] - closes[-5]) / closes[-5] if len(closes) >= 6 else 0.0
             trend_strength = abs(momentum)
 
             trend = "WAIT"
-            signal = "WAIT"
+            signal_state = "WAIT"
 
-            # simple rules (your current logic)
-            if rsi < 30 and momentum > 0:
-                trend = signal = "BUY"
-            elif rsi > 70 and momentum < 0:
-                trend = signal = "SELL"
+            # BUY: oversold + momentum turning up
+            if (rsi < 30) and (momentum > 0):
+                trend = signal_state = "BUY"
+            # SELL: overbought + momentum turning down
+            elif (rsi > 70) and (momentum < 0):
+                trend = signal_state = "SELL"
 
             confidence = confidence_score(rsi, trend_strength, momentum)
 
-            state_obj = {
-                "price": round(price, 2),
-                "rsi": round(rsi, 1),
-                "trend": trend,
-                "state": signal,
-                "confidence": confidence,
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "candles": candles[-30:],
-                "momentum": float(momentum),
-                "notes": f"src=Coinbase • momentum={momentum:.5f}",
-                "error": "",
-            }
-            LATEST_STATE = state_obj
-            atomic_write_json(STATE_FILE, state_obj)
+            # paper trade engine (always on)
+            paper_trade_logic(signal_state, confidence, price)
 
-            # Paper trade if enabled
-            if TRADE_STATE["mode"] == "paper":
-                maybe_paper_trade(signal, price, confidence)
-            else:
-                # live trading not implemented on purpose (safety)
-                pass
+            paper_snap = compute_portfolio_snapshot(PERSIST["paper"], price)
+            real_snap = compute_portfolio_snapshot(PERSIST["real"], price)
 
-            update_trade_metrics(price)
-            persist_trade_state()
+            with state_lock:
+                STATE.update({
+                    "price": round(price, 2),
+                    "rsi": round(rsi, 1),
+                    "trend": trend,
+                    "state": signal_state,
+                    "confidence": int(confidence),
+                    "momentum": float(momentum),
+                    "time": now_str(),
+                    "candles": candles[-30:],
+                    "notes": f"src=Coinbase • momentum={momentum:+.5f}",
+                    "error": "",
+                    "paper": paper_snap,
+                    "real": real_snap,
+                    "trades": {
+                        "paper": PERSIST["trades"]["paper"][-20:],
+                        "real": PERSIST["trades"]["real"][-20:],
+                    },
+                })
 
-            # Telegram alerts (signals)
+            # optional alerts (only when strong & cooldown)
             now = time.time()
             if (
-                signal in ("BUY", "SELL")
+                signal_state in ("BUY", "SELL")
                 and confidence >= MIN_CONFIDENCE
-                and now - LAST_ALERT_TS > ALERT_COOLDOWN
+                and (now - last_alert_ts) > ALERT_COOLDOWN
             ):
                 send_telegram(
-                    f"📢 BTC {signal} ALERT\n"
+                    f"📢 BTC {signal_state} ALERT\n"
                     f"Price: ${price:,.2f}\n"
                     f"RSI(1m): {round(rsi,1)}\n"
-                    f"Confidence: {confidence}%"
+                    f"Confidence: {confidence}%\n"
+                    f"Momentum(~5m): {momentum:+.5f}"
                 )
-                LAST_ALERT_TS = now
+                last_alert_ts = now
 
-            # Optional heartbeat (avoid spam; off by default)
-            if HEARTBEAT_SECS > 0 and now - LAST_HEARTBEAT_TS > HEARTBEAT_SECS:
-                send_telegram(
-                    f"💓 BTC AI heartbeat\nPrice: ${price:,.2f}\nRSI(1m): {round(rsi,1)}\nTrend: {trend}"
-                )
-                LAST_HEARTBEAT_TS = now
+            # persist
+            atomic_write_json(PERSIST_FILE, PERSIST)
+            atomic_write_json(STATE_FILE, STATE)
 
         except Exception as e:
-            err_obj = {
-                "price": 0,
-                "rsi": 0,
-                "trend": "WAIT",
-                "state": "WAIT",
-                "confidence": 0,
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "candles": [],
-                "momentum": 0.0,
-                "notes": "",
-                "error": str(e),
-            }
-            LATEST_STATE = err_obj
-            atomic_write_json(STATE_FILE, err_obj)
+            with state_lock:
+                STATE["error"] = str(e)
+                STATE["time"] = now_str()
+            atomic_write_json(STATE_FILE, STATE)
 
-        await asyncio.sleep(ENGINE_LOOP_SECS)
+        await asyncio.sleep(ENGINE_TICK_SECONDS)
 
+async def main():
+    # load persisted
+    loaded = safe_load_json(PERSIST_FILE, None)
+    if isinstance(loaded, dict):
+        PERSIST.update(loaded)
+
+    # start HTTP server in background thread
+    threading.Thread(target=start_http_server, daemon=True).start()
+
+    # one-time startup message (optional)
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        send_telegram("✅ BTC engine is live. Use /status")
+
+    await asyncio.gather(
+        engine_loop(),
+        telegram_loop(),
+        heartbeat_loop(),
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())

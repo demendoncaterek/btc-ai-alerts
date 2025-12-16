@@ -1,155 +1,153 @@
-import json
 import os
-from datetime import datetime
-
+import json
+import requests
 import streamlit as st
 import plotly.graph_objects as go
 
-STATE_FILE = os.getenv("STATE_FILE", "btc_state.json")      # produced by engine
-TRADE_FILE = os.getenv("TRADE_FILE", "btc_trades.json")     # produced by engine
-UI_REFRESH_SEC = int(os.getenv("UI_REFRESH_SEC", "5"))      # page reload interval
+# If you install streamlit-autorefresh, this will work.
+# If not installed, the app still runs (just no auto-refresh).
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except Exception:
+    HAS_AUTOREFRESH = False
+
+ENGINE_URL = os.getenv("ENGINE_URL", "").strip().rstrip("/")  # e.g. https://your-btc-engine.up.railway.app
+STATE_FILE = "btc_state.json"  # fallback if you run UI+engine in same service
 
 st.set_page_config(page_title="BTC AI Dashboard", layout="wide")
 st.title("🧠 BTC AI Dashboard")
-st.caption("Short-term • AI-filtered • Telegram alerts")
+st.caption("Short-term • AI-filtered • Telegram alerts • Paper + Real (logged) P/L")
 
-# ✅ Auto refresh without needing streamlit-extras
-st.markdown(
-    f"<meta http-equiv='refresh' content='{UI_REFRESH_SEC}'>",
-    unsafe_allow_html=True
-)
+if HAS_AUTOREFRESH:
+    st_autorefresh(interval=5000, key="btc_refresh")  # refresh every 5s
 
 
-def safe_load_json(path):
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = f.read().strip()
-            if not raw:
-                return None
-            return json.loads(raw)
-    except:
-        return None
+def fetch_state():
+    # Preferred: HTTP from engine
+    if ENGINE_URL:
+        try:
+            r = requests.get(f"{ENGINE_URL}/state", timeout=6)
+            if r.status_code == 200:
+                return r.json()
+        except:
+            return None
+
+    # Fallback: local file
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                if raw:
+                    return json.loads(raw)
+        except:
+            return None
+
+    return None
 
 
-def render_chart(candles, trades):
+def render_candles_with_momentum(candles):
     if not candles:
         st.info("⏳ Waiting for candle data…")
         return
 
-    x = [datetime.fromtimestamp(c["ts"]) for c in candles]
+    x = [c["time"] for c in candles]
+    o = [c["open"] for c in candles]
+    h = [c["high"] for c in candles]
+    l = [c["low"] for c in candles]
+    c = [c["close"] for c in candles]
 
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=x,
-                open=[c["open"] for c in candles],
-                high=[c["high"] for c in candles],
-                low=[c["low"] for c in candles],
-                close=[c["close"] for c in candles],
-                name="BTC",
-            )
-        ]
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Candlestick(
+            x=x,
+            open=o,
+            high=h,
+            low=l,
+            close=c,
+            name="BTC",
+        )
     )
 
-    # ---- Momentum arrows (based on 5-candle momentum) ----
-    closes = [c["close"] for c in candles]
-    arrows_x = []
-    arrows_y = []
-    arrows_symbol = []
+    # momentum arrows based on candle-to-candle close change
+    ups_x, ups_y, downs_x, downs_y = [], [], [], []
+    for i in range(1, len(c)):
+        if c[i] > c[i - 1]:
+            ups_x.append(x[i])
+            ups_y.append(c[i])
+        elif c[i] < c[i - 1]:
+            downs_x.append(x[i])
+            downs_y.append(c[i])
 
-    for i in range(len(candles)):
-        if i < 5:
-            continue
-        mom = (closes[i] - closes[i - 5]) / closes[i - 5] if closes[i - 5] else 0
-        # only show arrows if momentum is "noticeable" to reduce clutter
-        if abs(mom) < 0.0008:
-            continue
-
-        arrows_x.append(x[i])
-        if mom > 0:
-            arrows_y.append(candles[i]["high"] * 1.0005)
-            arrows_symbol.append("triangle-up")
-        else:
-            arrows_y.append(candles[i]["low"] * 0.9995)
-            arrows_symbol.append("triangle-down")
-
-    if arrows_x:
+    if ups_x:
         fig.add_trace(
             go.Scatter(
-                x=arrows_x,
-                y=arrows_y,
+                x=ups_x,
+                y=ups_y,
                 mode="markers",
-                marker=dict(size=10, symbol=arrows_symbol),
-                name="Momentum",
+                name="Up momentum",
+                marker=dict(symbol="triangle-up", size=10),
             )
         )
 
-    # ---- Trade markers (paper trades) ----
-    if trades:
-        bx, by, sx, sy = [], [], [], []
-        for t in trades:
-            ts = t.get("ts")
-            if not ts:
-                continue
-            dt = datetime.fromtimestamp(int(ts))
-            side = (t.get("side") or "").upper()
-            price = t.get("price")
-            if price is None:
-                continue
-            if side == "BUY":
-                bx.append(dt); by.append(price)
-            elif side == "SELL":
-                sx.append(dt); sy.append(price)
-
-        if bx:
-            fig.add_trace(
-                go.Scatter(
-                    x=bx, y=by, mode="markers",
-                    marker=dict(size=12, symbol="triangle-up"),
-                    name="BUY",
-                )
+    if downs_x:
+        fig.add_trace(
+            go.Scatter(
+                x=downs_x,
+                y=downs_y,
+                mode="markers",
+                name="Down momentum",
+                marker=dict(symbol="triangle-down", size=10),
             )
-        if sx:
-            fig.add_trace(
-                go.Scatter(
-                    x=sx, y=sy, mode="markers",
-                    marker=dict(size=12, symbol="triangle-down"),
-                    name="SELL",
-                )
-            )
+        )
 
     fig.update_layout(
-        height=380,
+        height=360,
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
         margin=dict(l=10, r=10, t=10, b=10),
         legend=dict(orientation="h"),
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 
-state = safe_load_json(STATE_FILE)
-trade = safe_load_json(TRADE_FILE) or {}
-
+state = fetch_state()
 if not state:
     st.info("⏳ Waiting for engine data…")
+    st.caption("Make sure ENGINE_URL is set to your btc-engine service URL (and /state works).")
     st.stop()
 
 if state.get("error"):
     st.error(f"Engine error: {state['error']}")
 
-# Top metrics
-c1, c2, c3, c4 = st.columns(4)
+paper = state.get("paper", {}) or {}
+real = state.get("real", {}) or {}
+
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("BTC Price", f"${state.get('price', 0):,.2f}")
 c2.metric("RSI (1m)", state.get("rsi", 0))
 c3.metric("Trend", state.get("trend", "WAIT"))
-c4.metric("🧠 Confidence", f"{state.get('confidence', 0)}%")
+c4.metric("Confidence", f"{state.get('confidence', 0)}%")
+c5.metric("Momentum (~5m)", f"{float(state.get('momentum', 0.0)):+.5f}")
 
 st.caption(f"Last update: {state.get('time','--:--:--')}  •  {state.get('notes','')}")
 
-conf = int(state.get("confidence", 0) or 0)
+pcol, rcol = st.columns(2)
+
+with pcol:
+    st.subheader("🧪 Paper Trading (Auto)")
+    st.metric("Equity", f"${paper.get('equity', 0):,.2f}")
+    st.metric("Total P/L", f"${paper.get('total_pl', 0):,.2f}")
+    st.caption(f"Cash: ${paper.get('cash',0):,.2f} • BTC: {paper.get('btc',0)}")
+
+with rcol:
+    st.subheader("🧾 Real Trades (Logged via Telegram)")
+    st.metric("Equity", f"${real.get('equity', 0):,.2f}")
+    st.metric("Total P/L", f"${real.get('total_pl', 0):,.2f}")
+    st.caption(f"Cash: ${real.get('cash',0):,.2f} • BTC: {real.get('btc',0)}")
+
+conf = int(state.get("confidence", 0))
 if conf >= 75:
     st.success("🔥 High-quality setup")
 elif conf >= 60:
@@ -157,34 +155,28 @@ elif conf >= 60:
 else:
     st.info("⏳ Waiting for stronger conditions")
 
-# Trading panel
-st.subheader("💼 Trading (Paper)")
-tc1, tc2, tc3, tc4 = st.columns(4)
-
-enabled = trade.get("enabled", False)
-mode = trade.get("mode", "paper")
-btc_qty = float(trade.get("btc_qty", 0) or 0)
-pos = "LONG" if btc_qty > 0 else "FLAT"
-
-tc1.metric("Trading", "ON ✅" if enabled else "OFF ⛔")
-tc2.metric("Mode", mode.upper())
-tc3.metric("Position", pos)
-tc4.metric("Equity", f"${float(trade.get('equity_usd', 0) or 0):,.2f}")
-
-p1, p2, p3 = st.columns(3)
-p1.metric("Realized P/L", f"${float(trade.get('realized_pnl', 0) or 0):,.2f}")
-p2.metric("Unrealized P/L", f"${float(trade.get('unrealized_pnl', 0) or 0):,.2f}")
-p3.metric("Updated", trade.get("updated_at", "--:--:--"))
-
 st.subheader("📊 BTC 1-Minute Candlesticks (Last 30 min)")
-render_chart(state.get("candles", []), trade.get("trades", []))
+render_candles_with_momentum(state.get("candles", []))
 
-with st.expander("🧾 Recent Trades"):
-    trades = trade.get("trades", [])
-    if not trades:
-        st.write("No trades yet.")
-    else:
-        st.dataframe(trades[::-1], use_container_width=True)
+st.subheader("📒 Recent Trades")
+t1, t2 = st.columns(2)
 
-if st.button("🔄 Refresh Now"):
-    st.rerun()
+with t1:
+    st.write("Paper trades")
+    st.dataframe((state.get("trades", {}) or {}).get("paper", []), use_container_width=True)
+
+with t2:
+    st.write("Real trades (logged)")
+    st.dataframe((state.get("trades", {}) or {}).get("real", []), use_container_width=True)
+
+with st.sidebar:
+    st.header("Telegram Commands")
+    st.code(
+        "/status\n"
+        "/logbuy 100\n"
+        "/logsell 100\n"
+        "/help",
+        language="text",
+    )
+    if not HAS_AUTOREFRESH:
+        st.warning("Auto-refresh not installed. Add `streamlit-autorefresh` to requirements.txt for live updates.")
