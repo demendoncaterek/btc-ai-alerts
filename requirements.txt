@@ -1,5 +1,6 @@
-streamlit
+fastapi
+uvicorn
 requests
 pandas
-plotly
-streamlit-autorefresh
+numpy
+python-telegram-bot==20.7
