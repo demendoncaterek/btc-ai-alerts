@@ -1,716 +1,590 @@
-import asyncio
-import json
+#!/usr/bin/env python3
+"""
+btc_telegram_alerts.py
+
+BTC "AI" Engine (rules-based). Exposes a tiny HTTP API for the UI + sends Telegram alerts.
+
+IMPORTANT:
+- This is NOT financial advice.
+- This engine does NOT "know all strategies". It only evaluates the indicators/filters coded here.
+- Default mode is PAPER trading (no real orders). Logged "real" trades are manual entries via /logbuy /logsell.
+"""
+
 import os
 import time
 import threading
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone, timedelta
+from typing import Optional
 
-import numpy as np
 import requests
-
-# ============================================================
-# BTC ENGINE (15m execution + 1h/4h bias + SL/TP + explanations)
-# ============================================================
-
-# -------------------------
-# CONFIG
-# -------------------------
-PRODUCT = os.getenv("PRODUCT", "BTC-USD")
-COINBASE_BASE = "https://api.exchange.coinbase.com"
-
-# Execution timeframe: 15m (more stable than 1m/5m)
-BASE_GRANULARITY = int(os.getenv("BASE_GRANULARITY", "900"))       # 900 = 15m
-BIAS1_GRANULARITY = int(os.getenv("BIAS1_GRANULARITY", "3600"))    # 1h
-BIAS2_GRANULARITY = int(os.getenv("BIAS2_GRANULARITY", "14400"))   # 4h
-
-BASE_LIMIT = int(os.getenv("BASE_LIMIT", "240"))   # 240*15m ≈ 60h
-BIAS1_LIMIT = int(os.getenv("BIAS1_LIMIT", "240")) # 240*1h ≈ 10d
-BIAS2_LIMIT = int(os.getenv("BIAS2_LIMIT", "240")) # 240*4h ≈ 40d
-
-STATE_FILE = os.getenv("STATE_FILE", "btc_state.json")
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-PORT = int(os.getenv("PORT", "8080"))
-
-# Alerts
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "3600"))  # 60 min
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
-
-# “Crazy move” detectors (relative move over last N bars)
-MOVE_WINDOW_BARS = int(os.getenv("MOVE_WINDOW_BARS", "12"))         # 12*15m = 3h
-MOVE_PCT = float(os.getenv("MOVE_PCT", "1.0")) / 100.0              # 1.00%
-
-# Paper trading
-PAPER_START_USD = float(os.getenv("PAPER_START_USD", "250.0"))
-PAPER_FEE_BPS = float(os.getenv("PAPER_FEE_BPS", "10")) / 10000.0   # 10 bps = 0.10%
-
-# ATR risk model
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.5"))
-TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
-
-# Heartbeat (0 disables)
-HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "120"))
-
-# Loop speed
-LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "20"))
+from flask import Flask, jsonify, request
 
 
 # -------------------------
-# Helpers
+# Config
 # -------------------------
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
 
-def atomic_write_json(path: str, obj: dict):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f)
-    os.replace(tmp, path)
+COINBASE_PRODUCT = os.getenv("COINBASE_PRODUCT", "BTC-USD")
+COINBASE_BASE = os.getenv("COINBASE_BASE", "https://api.exchange.coinbase.com").rstrip("/")
 
-def safe_float(x, default=0.0):
+# Base execution timeframe: typically "15m" for slower signals.
+BASE_TF = os.getenv("BASE_TF", "15m").strip().lower()  # examples: "1m", "5m", "15m", "1h"
+REFRESH_SECS = int(os.getenv("REFRESH_SECS", "15"))    # engine recalculates this often (lightweight)
+
+# Candle history (Coinbase endpoint returns up to ~300 candles per request)
+CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", "250"))
+
+# Trend/bias timeframes (resampled from BASE_TF)
+BIAS_TF_1 = os.getenv("BIAS_TF_1", "1h").strip().lower()
+BIAS_TF_2 = os.getenv("BIAS_TF_2", "4h").strip().lower()
+
+# Alerting
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+ALERT_COOLDOWN_SECS = int(os.getenv("ALERT_COOLDOWN_SECS", "900"))  # 15m default
+
+# Confidence thresholds (0..1)
+BUY_CONF = float(os.getenv("BUY_CONF", "0.72"))
+SELL_CONF = float(os.getenv("SELL_CONF", "0.72"))
+
+# Risk tuning (ATR multiple)
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))
+ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "2.0"))
+
+# "Watch" notifications (not trade signals)
+WATCH_WINDOW_MIN = int(os.getenv("WATCH_WINDOW_MIN", "180"))
+WATCH_EDGE_PCT = float(os.getenv("WATCH_EDGE_PCT", "0.25"))  # within 0.25% of window high/low triggers watch
+
+
+# -------------------------
+# Helpers: timeframes / indicators
+# -------------------------
+
+_ALLOWED_GRANULARITIES = {60, 300, 900, 3600, 21600, 86400}  # seconds (Coinbase Exchange candles)
+
+def _tf_to_seconds(tf: str) -> int:
+    """
+    Parses tf strings like '15m', '1h', '60s'. Returns seconds.
+    Also accepts bare numbers:
+      - if not supported, but (n*60) is supported, we treat it as minutes.
+      - otherwise snap to nearest supported value.
+    """
+    tf = str(tf).strip().lower()
+    if tf.endswith("ms"):
+        return max(1, int(float(tf[:-2]) / 1000))
+    if tf.endswith("s"):
+        return int(float(tf[:-1]))
+    if tf.endswith("m"):
+        return int(float(tf[:-1]) * 60)
+    if tf.endswith("h"):
+        return int(float(tf[:-1]) * 3600)
+    if tf.endswith("d"):
+        return int(float(tf[:-1]) * 86400)
+
     try:
-        return float(x)
-    except:
-        return default
+        g = int(float(tf))
+    except Exception:
+        return 900
 
-def send_telegram(msg: str):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10,
-        )
-    except:
-        pass
+    if g in _ALLOWED_GRANULARITIES:
+        return g
 
-def telegram_delete_webhook():
-    if not TELEGRAM_BOT_TOKEN:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
-            json={"drop_pending_updates": False},
-            timeout=10,
-        )
-    except:
-        pass
+    if (g * 60) in _ALLOWED_GRANULARITIES:
+        return g * 60
 
-def fetch_candles(granularity: int, limit: int):
-    url = f"{COINBASE_BASE}/products/{PRODUCT}/candles"
-    resp = requests.get(
-        url,
-        params={"granularity": granularity},
-        headers={"Accept": "application/json", "User-Agent": "btc-ai-alerts"},
-        timeout=15,
-    )
-    data = resp.json()
-    if not isinstance(data, list):
-        raise RuntimeError(f"Coinbase API error: {data}")
+    return min(_ALLOWED_GRANULARITIES, key=lambda x: abs(x - g))
 
-    data.sort(key=lambda x: x[0])
-    data = data[-limit:]
+BASE_SEC = _tf_to_seconds(BASE_TF)
 
-    candles = []
-    closes = []
-    highs = []
-    lows = []
-    for c in data:
-        ts = int(c[0])
-        # Coinbase format: [ time, low, high, open, close, volume ]
-        candles.append({
-            "ts": ts,
-            "time": datetime.fromtimestamp(ts).strftime("%m-%d %H:%M"),
-            "open": float(c[3]),
-            "high": float(c[2]),
-            "low": float(c[1]),
-            "close": float(c[4]),
+def _resample_factor(base_sec: int, target_tf: str) -> int:
+    target_sec = _tf_to_seconds(target_tf)
+    if target_sec <= 0:
+        return 1
+    return max(1, int(round(target_sec / base_sec)))
+
+def ema(vals, n):
+    if len(vals) < n:
+        return None
+    k = 2 / (n + 1)
+    e = vals[0]
+    for v in vals[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+def rsi(closes, n=14):
+    if len(closes) < n + 1:
+        return None
+    gains, losses = 0.0, 0.0
+    for i in range(-n, 0):
+        d = closes[i] - closes[i - 1]
+        if d >= 0:
+            gains += d
+        else:
+            losses -= d
+    if losses == 0:
+        return 100.0
+    rs = gains / losses
+    return 100 - (100 / (1 + rs))
+
+def true_range(h, l, prev_c):
+    return max(h - l, abs(h - prev_c), abs(l - prev_c))
+
+def atr(highs, lows, closes, n=14):
+    if len(closes) < n + 1:
+        return None
+    trs = []
+    for i in range(-n, 0):
+        trs.append(true_range(highs[i], lows[i], closes[i - 1]))
+    return sum(trs) / n
+
+def _chunk_ohlcv(candles, k):
+    """Downsamples candles by factor k with OHLCV aggregation."""
+    if k <= 1:
+        return candles[:]
+    out = []
+    for i in range(0, len(candles) - k + 1, k):
+        block = candles[i:i+k]
+        out.append({
+            "t": block[0]["t"],
+            "o": block[0]["o"],
+            "c": block[-1]["c"],
+            "h": max(x["h"] for x in block),
+            "l": min(x["l"] for x in block),
+            "v": sum(x.get("v", 0.0) for x in block),
         })
-        closes.append(float(c[4]))
-        highs.append(float(c[2]))
-        lows.append(float(c[1]))
-
-    return candles, np.array(closes, dtype=float), np.array(highs, dtype=float), np.array(lows, dtype=float)
-
-
-# -------------------------
-# Indicators
-# -------------------------
-def ema(x: np.ndarray, period: int) -> np.ndarray:
-    if len(x) == 0:
-        return np.array([])
-    alpha = 2.0 / (period + 1.0)
-    out = np.empty_like(x, dtype=float)
-    out[0] = x[0]
-    for i in range(1, len(x)):
-        out[i] = alpha * x[i] + (1 - alpha) * out[i - 1]
     return out
 
-def rsi(prices: np.ndarray, period: int = 14) -> float:
-    if len(prices) < period + 1:
-        return 50.0
-    deltas = np.diff(prices)
-    gains = np.maximum(deltas, 0.0)
-    losses = -np.minimum(deltas, 0.0)
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return float(100 - (100 / (1 + rs)))
 
-def atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 0.0
-    prev_close = closes[:-1]
-    tr = np.maximum(
-        highs[1:] - lows[1:],
-        np.maximum(np.abs(highs[1:] - prev_close), np.abs(lows[1:] - prev_close)),
-    )
-    return float(np.mean(tr[-period:]))
+# -------------------------
+# Data fetching
+# -------------------------
 
-def bollinger(prices: np.ndarray, period: int = 20, std_mult: float = 2.0):
-    if len(prices) < period:
-        return (np.nan, np.nan, np.nan)
-    window = prices[-period:]
-    mid = float(np.mean(window))
-    sd = float(np.std(window))
-    upper = mid + std_mult * sd
-    lower = mid - std_mult * sd
-    return (lower, mid, upper)
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": "btc-ai-alerts/1.0"})
 
-def macd_series(prices: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9):
-    if len(prices) < slow + signal:
-        return np.zeros_like(prices)
-    fast_ema = ema(prices, fast)
-    slow_ema = ema(prices, slow)
-    line = fast_ema - slow_ema
-    sig = ema(line, signal)
-    hist = line - sig
-    return hist
+def fetch_candles(granularity_sec: int, limit: int):
+    """
+    Coinbase Exchange candles endpoint (public).
+    Returns list of dicts sorted oldest->newest.
+    """
+    if granularity_sec not in _ALLOWED_GRANULARITIES:
+        granularity_sec = min(_ALLOWED_GRANULARITIES, key=lambda x: abs(x - granularity_sec))
 
-def zscore(prices: np.ndarray, period: int = 50) -> float:
-    if len(prices) < period:
-        return 0.0
-    w = prices[-period:]
-    mu = np.mean(w)
-    sd = np.std(w)
-    if sd == 0:
-        return 0.0
-    return float((prices[-1] - mu) / sd)
+    url = f"{COINBASE_BASE}/products/{COINBASE_PRODUCT}/candles"
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(seconds=granularity_sec * min(limit, 300))
+    params = {"granularity": granularity_sec, "start": start.isoformat(), "end": end.isoformat()}
+
+    r = _SESSION.get(url, params=params, timeout=10)
+    if r.status_code != 200:
+        raise RuntimeError(f"Coinbase HTTP {r.status_code}: {r.text[:250]}")
+    data = r.json()
+
+    if isinstance(data, dict):
+        raise RuntimeError(f"Coinbase API error: {data}")
+
+    rows = []
+    for t, low, high, open_, close, vol in data:
+        rows.append({"t": int(t), "l": float(low), "h": float(high), "o": float(open_), "c": float(close), "v": float(vol)})
+    rows.sort(key=lambda x: x["t"])
+    return rows[-limit:]
 
 
 # -------------------------
-# Store (paper + real logs)
+# Strategy / scoring (rules-based)
 # -------------------------
-def load_store():
-    if not os.path.exists(STATE_FILE):
-        return {}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            raw = f.read().strip() or "{}"
-            return json.loads(raw)
-    except:
-        return {}
 
-def init_store(store: dict):
-    store.setdefault("paper", {"usd": PAPER_START_USD, "btc": 0.0, "avg_entry": 0.0, "trades": []})
-    store.setdefault("real", {"trades": [], "position_btc": 0.0, "avg_entry": 0.0})
-    store.setdefault("events", [])
-    store.setdefault("last_state", {})
-    return store
+@dataclass
+class EngineState:
+    ok: bool
+    time: str
+    iso: str
+    src: str
 
-def paper_buy(store: dict, usd_amount: float, price: float, reason: str):
-    p = store["paper"]
-    usd_amount = max(0.0, min(usd_amount, p["usd"]))
-    if usd_amount <= 0:
-        return False
-    fee = usd_amount * PAPER_FEE_BPS
-    usd_net = usd_amount - fee
-    btc = usd_net / price
-    new_btc = p["btc"] + btc
-    if new_btc > 0:
-        p["avg_entry"] = (p["avg_entry"] * p["btc"] + price * btc) / new_btc
-    p["btc"] = new_btc
-    p["usd"] -= usd_amount
-    p["trades"].append({"ts": _now_iso(), "side": "BUY", "usd": usd_amount, "price": price, "fee": fee, "reason": reason})
-    return True
+    price: Optional[float] = None
+    rsi_base: Optional[float] = None
+    rsi_1h: Optional[float] = None
+    rsi_4h: Optional[float] = None
 
-def paper_sell_all(store: dict, price: float, reason: str):
-    p = store["paper"]
-    btc_amount = p["btc"]
-    if btc_amount <= 0:
-        return False
-    usd_gross = btc_amount * price
-    fee = usd_gross * PAPER_FEE_BPS
-    usd_net = usd_gross - fee
-    p["btc"] = 0.0
-    p["avg_entry"] = 0.0
-    p["usd"] += usd_net
-    p["trades"].append({"ts": _now_iso(), "side": "SELL", "btc": btc_amount, "price": price, "fee": fee, "reason": reason})
-    return True
+    ema20: Optional[float] = None
+    ema50: Optional[float] = None
+    trend_1h: Optional[str] = None
+    trend_4h: Optional[str] = None
 
-def calc_paper_summary(store: dict, price: float):
-    p = store["paper"]
-    equity = p["usd"] + p["btc"] * price
-    return {"equity": equity, "usd": p["usd"], "btc": p["btc"], "avg_entry": p["avg_entry"], "pnl": equity - PAPER_START_USD}
+    atr: Optional[float] = None
+    signal: Optional[str] = None  # BUY/SELL/WAIT
+    confidence: float = 0.0
+    reason: str = ""
 
-def real_log(store: dict, side: str, qty_btc: float, price: float, note: str):
-    r = store["real"]
-    side = side.upper()
-    if side not in ("BUY", "SELL"):
-        return False
-    qty_btc = max(0.0, qty_btc)
-    if qty_btc <= 0:
-        return False
+    dip_watch: Optional[dict] = None
+    peak_watch: Optional[dict] = None
 
-    if side == "BUY":
-        new_pos = r["position_btc"] + qty_btc
-        if new_pos > 0:
-            r["avg_entry"] = (r["avg_entry"] * r["position_btc"] + price * qty_btc) / new_pos
-        r["position_btc"] = new_pos
-    else:
-        r["position_btc"] = max(0.0, r["position_btc"] - qty_btc)
-        if r["position_btc"] == 0:
-            r["avg_entry"] = 0.0
+    candles: Optional[list] = None
+    markers: Optional[list] = None
 
-    r["trades"].append({"ts": _now_iso(), "side": side, "btc": qty_btc, "price": price, "note": note})
-    return True
+    paper: Optional[dict] = None
+    real: Optional[dict] = None
 
-def calc_real_summary(store: dict, price: float):
-    r = store["real"]
-    pos = r["position_btc"]
-    avg = r["avg_entry"]
-    unreal = (price - avg) * pos if pos > 0 else 0.0
-    return {"position_btc": pos, "avg_entry": avg, "unrealized": unreal}
+    error: Optional[str] = None
 
 
-# -------------------------
-# Decision logic (15m + 1h/4h bias)
-# -------------------------
-def bias_label(closes: np.ndarray):
-    # EMA50 vs EMA200 for bias
-    if len(closes) < 200:
-        return "NEUTRAL"
-    e50 = ema(closes, 50)[-1]
-    e200 = ema(closes, 200)[-1]
-    if e50 > e200:
-        return "UP"
-    if e50 < e200:
-        return "DOWN"
-    return "NEUTRAL"
+paper_usd = float(os.getenv("PAPER_USD", "250"))
+paper_btc = float(os.getenv("PAPER_BTC", "0"))
+paper_entry = None
+paper_trades = []
 
-def build_sl_tp(price: float, atr_v: float, side: str):
-    if atr_v <= 0:
-        return (None, None, None)
-    if side == "BUY":
-        sl = price - (SL_ATR_MULT * atr_v)
-        tp = price + (TP_ATR_MULT * atr_v)
-        rr = (tp - price) / max(1e-9, (price - sl))
-    else:
-        sl = price + (SL_ATR_MULT * atr_v)
-        tp = price - (TP_ATR_MULT * atr_v)
-        rr = (price - tp) / max(1e-9, (sl - price))
-    return (round(sl, 2), round(tp, 2), round(rr, 2))
+real_pos_btc = float(os.getenv("REAL_BTC", "0"))
+real_avg_entry = None
+real_trades = []
 
-def decide(base_prices, base_highs, base_lows, bias1_prices, bias2_prices):
-    price = float(base_prices[-1])
+def _trend_label(candles, fast=20, slow=50):
+    closes = [c["c"] for c in candles]
+    ef = ema(closes[-max(len(closes), fast):], fast) if len(closes) >= fast else None
+    es = ema(closes[-max(len(closes), slow):], slow) if len(closes) >= slow else None
+    if ef is None or es is None:
+        return None, None, "UNKNOWN"
+    if ef > es:
+        return ef, es, "UP"
+    if ef < es:
+        return ef, es, "DOWN"
+    return ef, es, "FLAT"
 
-    b1 = bias_label(bias1_prices)
-    b2 = bias_label(bias2_prices)
-    bias = "NEUTRAL"
-    if b1 == b2 and b1 in ("UP", "DOWN"):
-        bias = b1
+def _watch_levels(candles, window_min: int):
+    window_sec = window_min * 60
+    newest_t = candles[-1]["t"]
+    cutoff = newest_t - window_sec
+    recent = [c for c in candles if c["t"] >= cutoff]
+    if len(recent) < 5:
+        return None, None
+    return max(c["h"] for c in recent), min(c["l"] for c in recent)
 
-    base_rsi = rsi(base_prices, 14)
-    lower, mid, upper = bollinger(base_prices, 20, 2.0)
-    atr_v = atr(base_highs, base_lows, base_prices, ATR_PERIOD)
-    macd_hist = macd_series(base_prices)
-    macd_hist_now = float(macd_hist[-1])
-    zs = zscore(base_prices, 50)
+def _score_signal(base_candles, c1h, c4h):
+    closes = [c["c"] for c in base_candles]
+    highs = [c["h"] for c in base_candles]
+    lows  = [c["l"] for c in base_candles]
+    price = closes[-1]
 
-    # 3-hour move detector (crazy dip/peak)
-    lookback = min(MOVE_WINDOW_BARS, len(base_prices))
-    w = base_prices[-lookback:]
-    w_high = float(np.max(w))
-    w_low = float(np.min(w))
-    crazy_dip = price <= w_high * (1.0 - MOVE_PCT)
-    crazy_peak = price >= w_low * (1.0 + MOVE_PCT)
+    rsi_base = rsi(closes, 14)
+    rsi1 = rsi([x["c"] for x in c1h], 14) if c1h else None
+    rsi4 = rsi([x["c"] for x in c4h], 14) if c4h else None
 
-    # Confidence breakdown (explainable)
+    ema20v = ema(closes[-max(len(closes), 20):], 20) if len(closes) >= 20 else None
+    ema50v = ema(closes[-max(len(closes), 50):], 50) if len(closes) >= 50 else None
+    atrv = atr(highs, lows, closes, 14)
+
+    _, _, trend1 = _trend_label(c1h, 20, 50) if c1h else (None, None, "UNKNOWN")
+    _, _, trend4 = _trend_label(c4h, 20, 50) if c4h else (None, None, "UNKNOWN")
+
+    # Momentum markers
+    markers = []
+    if len(base_candles) >= 10:
+        e9 = ema(closes[-20:], 9)
+        for c in base_candles[-60:]:
+            if e9 is None:
+                break
+            if c["c"] > e9 and c["c"] > c["o"]:
+                markers.append({"t": c["t"], "price": c["c"], "kind": "bull"})
+            elif c["c"] < e9 and c["c"] < c["o"]:
+                markers.append({"t": c["t"], "price": c["c"], "kind": "bear"})
+
+    score_buy = 0.0
+    score_sell = 0.0
     reasons = []
-    score = 50
 
-    # Bias alignment (big deal for swing-style)
-    if bias == "UP":
-        score += 12
-        reasons.append("1h+4h bias UP")
-    elif bias == "DOWN":
-        score += 12
-        reasons.append("1h+4h bias DOWN")
-    else:
-        reasons.append("bias NEUTRAL")
+    if trend4 == "UP":
+        score_buy += 0.25; reasons.append("4h bias UP")
+    elif trend4 == "DOWN":
+        score_sell += 0.25; reasons.append("4h bias DOWN")
 
-    # RSI extremes
-    if base_rsi <= 30:
-        score += 12
-        reasons.append("RSI oversold")
-    elif base_rsi >= 70:
-        score += 12
-        reasons.append("RSI overbought")
+    if trend1 == "UP":
+        score_buy += 0.15; reasons.append("1h bias UP")
+    elif trend1 == "DOWN":
+        score_sell += 0.15; reasons.append("1h bias DOWN")
 
-    # Bollinger interaction
-    if not np.isnan(lower) and price <= lower:
-        score += 10
-        reasons.append("at/below lower Bollinger")
-    if not np.isnan(upper) and price >= upper:
-        score += 10
-        reasons.append("at/above upper Bollinger")
+    if rsi_base is not None:
+        if rsi_base <= 30:
+            score_buy += 0.25; reasons.append("RSI oversold")
+        elif rsi_base >= 70:
+            score_sell += 0.25; reasons.append("RSI overbought")
+        if rsi_base >= 55:
+            score_buy += 0.10
+        if rsi_base <= 45:
+            score_sell += 0.10
 
-    # MACD momentum
-    if macd_hist_now > 0:
-        score += 6
-        reasons.append("MACD momentum bullish")
-    elif macd_hist_now < 0:
-        score += 6
-        reasons.append("MACD momentum bearish")
+    if ema20v and ema50v:
+        if price > ema20v > ema50v:
+            score_buy += 0.15; reasons.append("Price above EMA20/50")
+        if price < ema20v < ema50v:
+            score_sell += 0.15; reasons.append("Price below EMA20/50")
 
-    # Z-score extremes
-    if zs <= -1.2:
-        score += 8
-        reasons.append("price statistically low (z)")
-    elif zs >= 1.2:
-        score += 8
-        reasons.append("price statistically high (z)")
+    if atrv:
+        score_buy += 0.05
+        score_sell += 0.05
 
-    # Crazy move flags
-    if crazy_dip:
-        score += 10
-        reasons.append("crazy dip (≈3h)")
-    if crazy_peak:
-        score += 10
-        reasons.append("crazy peak (≈3h)")
+    buy_conf = max(0.0, min(1.0, score_buy))
+    sell_conf = max(0.0, min(1.0, score_sell))
 
-    confidence = int(np.clip(score, 0, 100))
+    if trend4 == "UP":
+        sell_conf *= 0.6
+    if trend4 == "DOWN":
+        buy_conf *= 0.6
 
     signal = "WAIT"
-    signal_reason = "No high-probability setup"
+    confidence = max(buy_conf, sell_conf)
+    if buy_conf >= BUY_CONF and buy_conf > sell_conf:
+        signal = "BUY"; confidence = buy_conf
+    elif sell_conf >= SELL_CONF and sell_conf > buy_conf:
+        signal = "SELL"; confidence = sell_conf
 
-    # High-probability BUY: bias UP preferred, or deep mean reversion
-    if (bias == "UP" and base_rsi <= 40 and (price <= lower or crazy_dip) and macd_hist_now > 0) or (base_rsi <= 28 and zs <= -1.2):
-        signal = "BUY"
-        signal_reason = "Dip-in-uptrend or deep oversold bounce"
+    reason = ", ".join(reasons) if reasons else "No setup"
+    return signal, confidence, reason, markers, rsi_base, rsi1, rsi4, atrv, ema20v, ema50v, trend1, trend4
 
-    # High-probability SELL: bias DOWN preferred, or deep mean reversion
-    if (bias == "DOWN" and base_rsi >= 60 and (price >= upper or crazy_peak) and macd_hist_now < 0) or (base_rsi >= 72 and zs >= 1.2):
-        signal = "SELL"
-        signal_reason = "Peak-in-downtrend or deep overbought fade"
+def _telegram_send(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        _SESSION.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=10)
+        return True
+    except Exception:
+        return False
 
-    sl, tp, rr = (None, None, None)
-    if signal in ("BUY", "SELL"):
-        sl, tp, rr = build_sl_tp(price, atr_v, signal)
+_last_alert_ts = 0
+_last_watch_ts = 0
+_last_explain = "Not ready yet."
 
-    return {
-        "price": price,
-        "signal": signal,
-        "reason": signal_reason,
-        "confidence": confidence,
-        "confidence_reasons": reasons,
-        "bias_1h": b1,
-        "bias_4h": b2,
-        "bias": bias,
-        "rsi": round(base_rsi, 1),
-        "atr": round(atr_v, 2),
-        "bb_lower": None if np.isnan(lower) else round(lower, 2),
-        "bb_mid": None if np.isnan(mid) else round(mid, 2),
-        "bb_upper": None if np.isnan(upper) else round(upper, 2),
-        "zscore": round(zs, 2),
-        "macd_hist_now": round(macd_hist_now, 6),
-        "macd_hist_series": macd_hist.tolist(),
-        "crazy_dip": bool(crazy_dip),
-        "crazy_peak": bool(crazy_peak),
-        "sl": sl,
-        "tp": tp,
-        "rr": rr,
-    }
+def build_state():
+    global _last_explain
+    now = datetime.now(timezone.utc)
 
+    try:
+        base = fetch_candles(BASE_SEC, CANDLES_LIMIT)
+        price = base[-1]["c"]
 
-# -------------------------
-# Telegram commands
-# -------------------------
-LATEST_STATE = {"ok": False, "error": "starting"}
+        k1 = _resample_factor(BASE_SEC, BIAS_TF_1)
+        k4 = _resample_factor(BASE_SEC, BIAS_TF_2)
+        c1h = _chunk_ohlcv(base, k1)
+        c4h = _chunk_ohlcv(base, k4)
 
-def build_status_text(s: dict):
-    price = s.get("price", 0)
-    msg = (
-        f"🧠 BTC Bot Status\n"
-        f"Price: ${price:,.2f}\n"
-        f"Signal: {s.get('signal','WAIT')} (conf {s.get('confidence',0)}%)\n"
-        f"Bias: {s.get('bias','NEUTRAL')} (1h={s.get('bias_1h','?')}, 4h={s.get('bias_4h','?')})\n"
-        f"RSI(15m): {s.get('rsi','--')}\n"
-    )
-    if s.get("sl") and s.get("tp"):
-        msg += f"SL: ${s['sl']:,.2f}  TP: ${s['tp']:,.2f}  R:R≈{s.get('rr','--')}\n"
-    msg += f"Reason: {s.get('reason','')}\n"
-    return msg
+        signal, conf, reason, markers, rsi_b, rsi1, rsi4, atrv, ema20v, ema50v, tr1, tr4 = _score_signal(base, c1h, c4h)
 
-def build_explain_text(s: dict):
-    lines = ["🧠 Why the bot thinks this:", f"Signal: {s.get('signal')} (conf {s.get('confidence')}%)", ""]
-    for r in s.get("confidence_reasons", [])[:20]:
-        lines.append(f"• {r}")
-    if s.get("sl") and s.get("tp"):
-        lines.append("")
-        lines.append(f"Risk idea (ATR): SL ${s['sl']:,.2f} | TP ${s['tp']:,.2f} | R:R≈{s.get('rr')}")
-    return "\n".join(lines)
+        win_hi, win_lo = _watch_levels(base, WATCH_WINDOW_MIN)
+        dip_watch = peak_watch = None
+        if win_hi and win_lo:
+            if abs(price - win_lo) / win_lo * 100 <= WATCH_EDGE_PCT:
+                dip_watch = {"window_min": WATCH_WINDOW_MIN, "low": win_lo, "price": price, "edge_pct": WATCH_EDGE_PCT}
+            if abs(win_hi - price) / win_hi * 100 <= WATCH_EDGE_PCT:
+                peak_watch = {"window_min": WATCH_WINDOW_MIN, "high": win_hi, "price": price, "edge_pct": WATCH_EDGE_PCT}
 
-def handle_command(text: str):
-    if not text:
-        return
-    parts = text.strip().split()
-    cmd = parts[0].lower()
-    s = LATEST_STATE if isinstance(LATEST_STATE, dict) else {}
+        sl = tp = None
+        if atrv:
+            if signal == "BUY":
+                sl = price - ATR_SL_MULT * atrv
+                tp = price + ATR_TP_MULT * atrv
+            elif signal == "SELL":
+                sl = price + ATR_SL_MULT * atrv
+                tp = price - ATR_TP_MULT * atrv
 
-    if cmd in ("/start", "/help"):
-        send_telegram("✅ Bot running.\nCommands: /status, /explain, /logbuy 100, /logsell 100")
-        return
+        _last_explain = (
+            f"Signal={signal} (conf={conf:.0%}) | price={price:.2f}\n"
+            f"Bias: 1h={tr1}, 4h={tr4}\n"
+            f"RSI: base={rsi_b if rsi_b is not None else 'n/a'} | 1h={rsi1 if rsi1 is not None else 'n/a'} | 4h={rsi4 if rsi4 is not None else 'n/a'}\n"
+        )
+        _last_explain += (f"ATR(base)={atrv:.2f}" if atrv else "ATR(base)=n/a")
+        if sl and tp:
+            _last_explain += f"\nSuggested SL={sl:.2f} TP={tp:.2f} (ATR x{ATR_SL_MULT}/{ATR_TP_MULT})"
+        if reason:
+            _last_explain += f"\nReason: {reason}"
 
-    if cmd == "/status":
-        send_telegram(build_status_text(s))
-        return
+        st = EngineState(
+            ok=True,
+            time=now.strftime("%H:%M:%S"),
+            iso=now.isoformat(),
+            src="Coinbase",
+            price=price,
+            rsi_base=rsi_b,
+            rsi_1h=rsi1,
+            rsi_4h=rsi4,
+            ema20=ema20v,
+            ema50=ema50v,
+            trend_1h=tr1,
+            trend_4h=tr4,
+            atr=atrv,
+            signal=signal,
+            confidence=float(conf),
+            reason=reason,
+            dip_watch=dip_watch,
+            peak_watch=peak_watch,
+            candles=base[-120:],
+            markers=markers,
+            paper={
+                "usd": paper_usd,
+                "btc": paper_btc,
+                "entry": paper_entry,
+                "equity": (paper_usd + paper_btc * price),
+                "trades": paper_trades[-100:],
+            },
+            real={
+                "pos_btc": real_pos_btc,
+                "avg_entry": real_avg_entry,
+                "unreal_pl": (real_pos_btc * (price - real_avg_entry)) if (real_pos_btc and real_avg_entry) else 0.0,
+                "trades": real_trades[-100:],
+            },
+        )
+        return st, sl, tp
 
-    if cmd == "/explain":
-        send_telegram(build_explain_text(s))
-        return
+    except Exception as e:
+        st = EngineState(ok=False, time=now.strftime("%H:%M:%S"), iso=now.isoformat(), src="Coinbase", error=str(e))
+        return st, None, None
 
-    if cmd in ("/logbuy", "/logsell"):
-        if len(parts) < 2:
-            send_telegram("Usage: /logbuy 100 [price] or /logsell 100 [price]")
-            return
-        usd_amount = safe_float(parts[1], 0.0)
-        price = safe_float(parts[2], s.get("price", 0.0)) if len(parts) >= 3 else float(s.get("price", 0.0))
-        if usd_amount <= 0 or price <= 0:
-            send_telegram("Invalid amount/price.")
-            return
+def _format_alert(state: EngineState, sl, tp):
+    parts = [
+        "🧠 BTC Alert",
+        f"Price: ${state.price:,.2f}" if state.price is not None else "Price: n/a",
+        f"Signal: {state.signal} (conf {state.confidence:.0%})",
+        f"Bias: 1h={state.trend_1h} | 4h={state.trend_4h}",
+        f"RSI(base)={state.rsi_base:.1f}" if state.rsi_base is not None else "RSI(base)=n/a",
+    ]
+    if state.atr is not None:
+        parts.append(f"ATR(base): {state.atr:.2f}")
+    if sl and tp:
+        parts.append(f"SL: {sl:,.2f} | TP: {tp:,.2f}")
+    if state.reason:
+        parts.append(f"Reason: {state.reason}")
+    return "\n".join(parts)
 
-        qty_btc = usd_amount / price
-        store = init_store(load_store())
-        side = "BUY" if cmd == "/logbuy" else "SELL"
-        ok = real_log(store, side, qty_btc, price, note="manual log via telegram")
-        if ok:
-            atomic_write_json(STATE_FILE, store)
-            send_telegram(f"✅ Logged {side} ${usd_amount:,.2f} (~{qty_btc:.6f} BTC) @ ${price:,.2f}")
-        else:
-            send_telegram("Could not log trade.")
-        return
+def _format_watch(state: EngineState):
+    if state.peak_watch:
+        w = state.peak_watch
+        return f"📈 BTC Peak Watch\nPrice: ${w['price']:,.2f}\nNear {w['window_min']}m high: {w['high']:,.2f}\nBias: {state.trend_4h}"
+    if state.dip_watch:
+        w = state.dip_watch
+        return f"📉 BTC Dip Watch\nPrice: ${w['price']:,.2f}\nNear {w['window_min']}m low: {w['low']:,.2f}\nBias: {state.trend_4h}"
+    return None
 
-def telegram_poll_loop():
-    if not TELEGRAM_BOT_TOKEN:
-        return
-    telegram_delete_webhook()
-    offset = None
-
+def alerts_loop():
+    global _last_alert_ts, _last_watch_ts
     while True:
-        try:
-            params = {"timeout": 30}
-            if offset is not None:
-                params["offset"] = offset
-            r = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                params=params,
-                timeout=35,
-            )
-            data = r.json()
-            if not data.get("ok"):
-                time.sleep(2)
-                continue
+        state, sl, tp = build_state()
+        now = int(time.time())
 
-            for upd in data.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or {}
-                chat = msg.get("chat") or {}
-                chat_id = str(chat.get("id", ""))
+        if state.ok and state.signal in ("BUY", "SELL"):
+            if now - _last_alert_ts >= ALERT_COOLDOWN_SECS:
+                _telegram_send(_format_alert(state, sl, tp))
+                _last_alert_ts = now
 
-                if TELEGRAM_CHAT_ID and str(TELEGRAM_CHAT_ID) != chat_id:
-                    continue
+        if state.ok and (state.peak_watch or state.dip_watch):
+            if now - _last_watch_ts >= max(180, ALERT_COOLDOWN_SECS // 3):
+                msg = _format_watch(state)
+                if msg:
+                    _telegram_send(msg)
+                _last_watch_ts = now
 
-                handle_command(msg.get("text", ""))
+        time.sleep(REFRESH_SECS)
 
-        except Exception:
-            time.sleep(2)
+app = Flask(__name__)
+_state_cache = {"state": None, "ts": 0}
 
+def get_state_cached():
+    now = time.time()
+    if _state_cache["state"] is None or (now - _state_cache["ts"]) > 10:
+        s, sl, tp = build_state()
+        d = asdict(s)
+        d["suggested"] = {"sl": sl, "tp": tp}
+        _state_cache["state"] = d
+        _state_cache["ts"] = now
+    return _state_cache["state"]
 
-# -------------------------
-# HTTP endpoints for UI
-# -------------------------
-class Handler(BaseHTTPRequestHandler):
-    def _json(self, code: int, payload: dict):
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "service": "btc-engine", "time": datetime.now(timezone.utc).isoformat()})
 
-    def do_GET(self):
-        path = urlparse(self.path).path
-        if path == "/health":
-            self._json(200, {"ok": True, "service": "btc-engine", "time": _now_iso()})
-            return
-        if path == "/state":
-            self._json(200, LATEST_STATE)
-            return
-        self._json(404, {"ok": False, "error": "not found"})
+@app.get("/state")
+def state():
+    return jsonify(get_state_cached())
 
-def start_http_server():
-    httpd = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"✅ Engine HTTP server listening on 0.0.0.0:{PORT}")
-    httpd.serve_forever()
+@app.get("/explain")
+def explain():
+    return jsonify({"ok": True, "explain": _last_explain})
 
+@app.get("/trades")
+def trades():
+    return jsonify({"ok": True, "paper": paper_trades[-500:], "real": real_trades[-500:]})
 
-# -------------------------
-# Main loop
-# -------------------------
-async def main():
-    global LATEST_STATE
+@app.post("/paper/buy")
+def paper_buy():
+    global paper_usd, paper_btc, paper_entry
+    d = get_state_cached()
+    if not d.get("ok") or not d.get("price"):
+        return jsonify({"ok": False, "error": "engine not ready"}), 400
+    price = float(d["price"])
+    if paper_usd <= 1:
+        return jsonify({"ok": False, "error": "no paper USD available"}), 400
+    qty = paper_usd / price
+    paper_btc += qty
+    paper_usd = 0.0
+    paper_entry = price
+    paper_trades.append({"ts": d["iso"], "side": "BUY", "price": price, "qty": qty, "mode": "paper"})
+    return jsonify({"ok": True, "paper_usd": paper_usd, "paper_btc": paper_btc})
 
-    threading.Thread(target=start_http_server, daemon=True).start()
+@app.post("/paper/sell")
+def paper_sell():
+    global paper_usd, paper_btc, paper_entry
+    d = get_state_cached()
+    if not d.get("ok") or not d.get("price"):
+        return jsonify({"ok": False, "error": "engine not ready"}), 400
+    price = float(d["price"])
+    if paper_btc <= 0:
+        return jsonify({"ok": False, "error": "no paper BTC to sell"}), 400
+    qty = paper_btc
+    paper_usd += qty * price
+    paper_btc = 0.0
+    paper_entry = None
+    paper_trades.append({"ts": d["iso"], "side": "SELL", "price": price, "qty": qty, "mode": "paper"})
+    return jsonify({"ok": True, "paper_usd": paper_usd, "paper_btc": paper_btc})
 
-    store = init_store(load_store())
-    atomic_write_json(STATE_FILE, store)
+@app.post("/logbuy")
+def logbuy():
+    global real_pos_btc, real_avg_entry
+    d = request.get_json(force=True, silent=True) or {}
+    qty = float(d.get("qty", 0.0))
+    price = float(d.get("price", 0.0))
+    ts = d.get("ts") or datetime.now(timezone.utc).isoformat()
+    if qty <= 0 or price <= 0:
+        return jsonify({"ok": False, "error": "qty and price required"}), 400
+    new_pos = real_pos_btc + qty
+    if real_avg_entry is None:
+        real_avg_entry = price
+    else:
+        real_avg_entry = (real_avg_entry * real_pos_btc + price * qty) / new_pos
+    real_pos_btc = new_pos
+    real_trades.append({"ts": ts, "side": "BUY", "price": price, "qty": qty, "mode": "real"})
+    return jsonify({"ok": True})
 
-    if TELEGRAM_BOT_TOKEN:
-        threading.Thread(target=telegram_poll_loop, daemon=True).start()
+@app.post("/logsell")
+def logsell():
+    global real_pos_btc, real_avg_entry
+    d = request.get_json(force=True, silent=True) or {}
+    qty = float(d.get("qty", 0.0))
+    price = float(d.get("price", 0.0))
+    ts = d.get("ts") or datetime.now(timezone.utc).isoformat()
+    if qty <= 0 or price <= 0:
+        return jsonify({"ok": False, "error": "qty and price required"}), 400
+    if qty > real_pos_btc:
+        qty = real_pos_btc
+    real_pos_btc -= qty
+    if real_pos_btc <= 0:
+        real_pos_btc = 0.0
+        real_avg_entry = None
+    real_trades.append({"ts": ts, "side": "SELL", "price": price, "qty": qty, "mode": "real"})
+    return jsonify({"ok": True})
 
-    if TELEGRAM_BOT_TOKEN and HEARTBEAT_MINUTES > 0:
-        send_telegram("✅ BTC engine restarted. Use /status or /explain anytime.")
-
-    last_alert = 0.0
-    last_move_alert = 0.0
-    last_heartbeat = 0.0
-
-    print("✅ BTC Alert Engine Running (15m exec • 1h+4h bias)")
-
-    while True:
-        try:
-            base_candles, base_prices, base_highs, base_lows = fetch_candles(BASE_GRANULARITY, BASE_LIMIT)
-            _, b1_prices, _, _ = fetch_candles(BIAS1_GRANULARITY, BIAS1_LIMIT)
-            _, b2_prices, _, _ = fetch_candles(BIAS2_GRANULARITY, BIAS2_LIMIT)
-
-            d = decide(base_prices, base_highs, base_lows, b1_prices, b2_prices)
-            price = d["price"]
-
-            store = init_store(load_store())
-
-            # Event markers for UI
-            events = store.get("events", [])
-            now = time.time()
-
-            # Crazy move alert (dip/peak)
-            if (d["crazy_dip"] or d["crazy_peak"]) and now - last_move_alert > 3600:
-                last_move_alert = now
-                label = "CRAZY DIP" if d["crazy_dip"] else "CRAZY PEAK"
-                events.append({"ts": _now_iso(), "type": label, "price": price, "label": label})
-                send_telegram(
-                    f"⚡ {label}\nPrice: ${price:,.2f}\n"
-                    f"Window: ~{MOVE_WINDOW_BARS*BASE_GRANULARITY//60}m\nBias: {d['bias']}"
-                )
-
-            # High-confidence setup alert (+ optional paper sim)
-            if d["signal"] in ("BUY", "SELL") and d["confidence"] >= MIN_CONFIDENCE and now - last_alert > ALERT_COOLDOWN:
-                last_alert = now
-                events.append({"ts": _now_iso(), "type": d["signal"], "price": price, "label": d["signal"]})
-
-                msg = (
-                    f"📢 BTC {d['signal']} (setup)\n"
-                    f"Price: ${price:,.2f}\n"
-                    f"Bias: {d['bias']} (1h={d['bias_1h']}, 4h={d['bias_4h']})\n"
-                    f"RSI(15m): {d['rsi']} | Conf: {d['confidence']}%\n"
-                    f"Reason: {d['reason']}\n"
-                )
-                if d["sl"] and d["tp"]:
-                    msg += f"SL: ${d['sl']:,.2f} | TP: ${d['tp']:,.2f} | R:R≈{d.get('rr')}\n"
-                msg += "Use /explain for the full breakdown."
-                send_telegram(msg)
-
-                # Conservative paper sim: buy only if flat, sell only if holding
-                p = store["paper"]
-                if d["signal"] == "BUY" and p["btc"] <= 0 and p["usd"] > 10:
-                    paper_buy(store, usd_amount=min(50.0, p["usd"]), price=price, reason=d["reason"])
-                elif d["signal"] == "SELL" and p["btc"] > 0:
-                    paper_sell_all(store, price=price, reason=d["reason"])
-
-            # Heartbeat
-            if TELEGRAM_BOT_TOKEN and HEARTBEAT_MINUTES > 0 and now - last_heartbeat > HEARTBEAT_MINUTES * 60:
-                last_heartbeat = now
-                send_telegram(f"🫀 Heartbeat\nPrice: ${price:,.2f}\nSignal: {d['signal']} (conf {d['confidence']}%)\nBias: {d['bias']}")
-
-            # Trim events
-            if len(events) > 300:
-                events = events[-300:]
-            store["events"] = events
-
-            # Build UI state
-            state = {
-                "ok": True,
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "iso": _now_iso(),
-                "product": PRODUCT,
-
-                "price": round(price, 2),
-                "signal": d["signal"],
-                "reason": d["reason"],
-                "confidence": d["confidence"],
-                "confidence_reasons": d["confidence_reasons"],
-
-                "base_granularity": BASE_GRANULARITY,
-                "bias_1h": d["bias_1h"],
-                "bias_4h": d["bias_4h"],
-                "bias": d["bias"],
-
-                "rsi": d["rsi"],
-                "atr": d["atr"],
-                "bb_lower": d["bb_lower"],
-                "bb_mid": d["bb_mid"],
-                "bb_upper": d["bb_upper"],
-                "zscore": d["zscore"],
-                "macd_hist_now": d["macd_hist_now"],
-                "macd_hist_series": d["macd_hist_series"],
-
-                "crazy_dip": d["crazy_dip"],
-                "crazy_peak": d["crazy_peak"],
-
-                "sl": d["sl"],
-                "tp": d["tp"],
-                "rr": d["rr"],
-
-                "candles": base_candles[-120:],  # last ~30h on 15m
-                "events": store.get("events", []),
-
-                "paper_summary": calc_paper_summary(store, price),
-                "real_summary": calc_real_summary(store, price),
-
-                "paper_trades": store["paper"].get("trades", [])[-200:],
-                "real_trades": store["real"].get("trades", [])[-200:],
-
-                "notes": "src=Coinbase • 15m execution • 1h+4h bias • ATR SL/TP",
-                "error": "",
-            }
-
-            store["last_state"] = state
-            atomic_write_json(STATE_FILE, store)
-            LATEST_STATE = state
-
-        except Exception as e:
-            LATEST_STATE = {"ok": False, "time": datetime.now().strftime("%H:%M:%S"), "iso": _now_iso(), "error": str(e)}
-
-        await asyncio.sleep(LOOP_SECONDS)
-
+def main():
+    threading.Thread(target=alerts_loop, daemon=True).start()
+    port = int(os.getenv("PORT", "8080"))
+    print(f"✅ BTC Alert Engine Running ({BASE_TF} base • {BIAS_TF_1}+{BIAS_TF_2} bias • ATR SL/TP)")
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
