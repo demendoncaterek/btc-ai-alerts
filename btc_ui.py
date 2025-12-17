@@ -59,7 +59,7 @@ if not state.get("ok"):
 
     st.stop()
 
-# ================= OVERVIEW PAGE =================
+# ================= OVERVIEW =================
 if page == "overview":
     st.title("🧠 BTC AI Dashboard")
     st.caption("15m execution • 1h+4h bias • ATR SL/TP • Telegram alerts")
@@ -77,13 +77,26 @@ if page == "overview":
     elif state["signal"] == "SELL":
         st.error("🔴 SELL setup detected")
 
+    # ================= CANDLES =================
     st.subheader("📊 BTC Candlesticks")
 
     candles = pd.DataFrame(state["candles"])
+
+    # 🔒 SAFE TIME COLUMN DETECTION
+    if "time" in candles.columns:
+        x_col = candles["time"]
+    elif "timestamp" in candles.columns:
+        x_col = candles["timestamp"]
+    elif "t" in candles.columns:
+        x_col = candles["t"]
+    else:
+        candles["index_time"] = range(len(candles))
+        x_col = candles["index_time"]
+
     fig = go.Figure()
 
     fig.add_trace(go.Candlestick(
-        x=candles["time"],
+        x=x_col,
         open=candles["open"],
         high=candles["high"],
         low=candles["low"],
@@ -91,7 +104,7 @@ if page == "overview":
         name="BTC"
     ))
 
-    # Momentum arrows
+    # Momentum arrows (optional)
     if "bullish_marks" in state:
         fig.add_trace(go.Scatter(
             x=state["bullish_marks"]["x"],
@@ -111,14 +124,14 @@ if page == "overview":
         ))
 
     fig.update_layout(
-        height=500,
+        height=520,
         xaxis_rangeslider_visible=False,
         template="plotly_dark"
     )
 
     st.plotly_chart(fig, use_container_width=True)
 
-# ================= TRADES PAGE =================
+# ================= TRADES =================
 elif page == "trades":
     st.title("📒 Trade Journal")
     st.caption("Paper + Real trades (logged by engine)")
@@ -134,7 +147,7 @@ elif page == "trades":
             st.dataframe(paper, use_container_width=True)
 
     with col2:
-        st.subheader("💰 Real Trades (Logged)")
+        st.subheader("💰 Real Trades")
         real = pd.DataFrame(state.get("real_trades", []))
         if real.empty:
             st.info("No real trades logged yet.")
@@ -143,13 +156,11 @@ elif page == "trades":
 
     st.divider()
 
-    st.subheader("📈 P/L Summary")
     cols = st.columns(4)
     cols[0].metric("Paper Equity", f"${state['paper_equity']:,.2f}")
     cols[1].metric("Paper P/L", f"${state['paper_pl']:,.2f}")
     cols[2].metric("Real BTC", f"{state['real_btc']:.6f}")
     cols[3].metric("Unrealized P/L", f"${state['real_unrealized_pl']:,.2f}")
 
-# ================= FALLBACK =================
 else:
     st.error("Unknown page")
