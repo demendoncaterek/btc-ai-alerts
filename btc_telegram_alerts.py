@@ -1,477 +1,448 @@
-import os
-import time
-import json
-import math
-import csv
-import requests
-import pandas as pd
+import os, json, time, math, threading
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-from datetime import datetime, timezone
+import pandas as pd
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# ================= CONFIG =================
-SYMBOL = "BTC-USD"
-COINBASE_URL = "https://api.exchange.coinbase.com"
+# ---------- config ----------
+PRODUCT = os.getenv("PRODUCT", "BTC-USD")
+CB_BASE = os.getenv("COINBASE_BASE", "https://api.exchange.coinbase.com").rstrip("/")
+POLL_SEC = float(os.getenv("POLL_SEC", "10"))
 
-# Coinbase supported granularities: 60, 300, 900, 3600, 21600, 86400
-G_5M = 300
-G_1H = 3600
-G_6H = 21600
+# Coinbase-supported granularities (sec)
+SUPPORTED = (60, 300, 900, 3600, 21600, 86400)
+GRAN_5M  = int(os.getenv("GRAN_5M",  "300"))
+GRAN_15M = int(os.getenv("GRAN_15M", "900"))
+GRAN_1H  = int(os.getenv("GRAN_1H",  "3600"))
 
-RSI_PERIOD = 14
-ATR_PERIOD = 14
-EMA_FAST = 50
-EMA_SLOW = 200
+CONF_BUY   = float(os.getenv("CONF_BUY",   "72"))  # 0..100
+CONF_SELL  = float(os.getenv("CONF_SELL",  "72"))
+CONF_WATCH = float(os.getenv("CONF_WATCH", "55"))
 
-# Defaults (can be overridden by params.json)
-DEFAULT_PARAMS = {
-    "min_confidence": 70.0,               # alerts / paper entries only above this
-    "atr_sl_mult": 1.5,
-    "atr_tp_mult": 2.5,
-    "rsi_oversold": 35.0,
-    "rsi_overbought": 65.0,
-    # confidence weights
-    "w_htf_alignment": 30.0,
-    "w_rsi_signal": 25.0,
-    "w_momentum": 20.0,
-    "w_divergence_bonus": 10.0,
-    # paper sizing
-    "paper_start_usd": 1000.0,
-    "paper_risk_fraction": 0.25,          # fraction of equity to allocate per trade (simple)
-}
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "900"))
 
-PARAMS_FILE = os.getenv("PARAMS_FILE", "params.json")
+TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Logs: for Railway, best is to mount a volume and point LOG_DIR to it.
-LOG_DIR = os.getenv("LOG_DIR", ".")
-SIGNAL_LOG = os.path.join(LOG_DIR, "signals.csv")
-PAPER_LOG = os.path.join(LOG_DIR, "paper_trades.csv")
-# =========================================
+DATA_DIR = os.getenv("DATA_DIR", ".")
+SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", os.path.join(DATA_DIR, "signals.jsonl"))
+PAPER_LOG_PATH  = os.getenv("PAPER_LOG_PATH",  os.path.join(DATA_DIR, "paper_trades.jsonl"))
+REAL_LOG_PATH   = os.getenv("REAL_LOG_PATH",   os.path.join(DATA_DIR, "real_trades.jsonl"))
+PAPER_START_USD = float(os.getenv("PAPER_START_USD", "250"))
 
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------- utils ----------
+def utcnow() -> datetime: return datetime.now(timezone.utc)
+def iso(dt: datetime) -> str: return dt.astimezone(timezone.utc).isoformat()
+def clamp(x: float, lo: float, hi: float) -> float: return max(lo, min(hi, x))
+def fnum(x: Any, d: float = float("nan")) -> float:
+    try: return float(x)
+    except Exception: return d
 
-# ================= UTIL =================
-def now_utc_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def snap_gran(g: int) -> int:
+    return g if g in SUPPORTED else min(SUPPORTED, key=lambda s: abs(s-g))
 
-def fetch_candles(granularity: int, limit: int = 300) -> pd.DataFrame:
-    url = f"{COINBASE_URL}/products/{SYMBOL}/candles"
-    r = requests.get(url, params={"granularity": granularity}, timeout=12)
-    r.raise_for_status()
-
-    df = pd.DataFrame(r.json(), columns=["time","low","high","open","close","volume"])
-    if df.empty:
-        return df
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df = df.sort_values("time").reset_index(drop=True)
-    return df.tail(limit)
-
-def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([(high-low), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-def ema_trend(close: pd.Series) -> str:
-    ema_fast = close.ewm(span=EMA_FAST).mean()
-    ema_slow = close.ewm(span=EMA_SLOW).mean()
-    return "UP" if float(ema_fast.iloc[-1]) > float(ema_slow.iloc[-1]) else "DOWN"
-
-def momentum_lookback(close: pd.Series, n: int = 6) -> float:
-    if len(close) < n + 1:
-        return 0.0
-    return float((close.iloc[-1] / close.iloc[-1-n]) - 1.0)
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def find_swings(series: pd.Series, lookback: int = 5):
-    if len(series) < (lookback * 2 + 10):
-        return [], []
-    lows, highs = [], []
-    arr = series.values
-    for i in range(lookback, len(arr) - lookback):
-        w = arr[i-lookback:i+lookback+1]
-        if arr[i] == np.min(w): lows.append(i)
-        if arr[i] == np.max(w): highs.append(i)
-    return lows[-2:], highs[-2:]
-
-def detect_rsi_divergence(df: pd.DataFrame) -> dict:
-    out = {"bullish": False, "bearish": False, "detail": ""}
-    if df is None or df.empty or len(df) < 80:
-        return out
-    rsi = compute_rsi(df["close"], RSI_PERIOD)
-    if rsi.isna().all():
-        return out
-    lows_idx, highs_idx = find_swings(df["close"], lookback=5)
-    if len(lows_idx) == 2:
-        i1, i2 = lows_idx
-        p1, p2 = float(df["close"].iloc[i1]), float(df["close"].iloc[i2])
-        r1, r2 = float(rsi.iloc[i1]), float(rsi.iloc[i2])
-        if p2 < p1 and r2 > r1:
-            out["bullish"] = True
-            out["detail"] += f"Bull div: price LL ({p1:.0f}->{p2:.0f}) + RSI HL ({r1:.1f}->{r2:.1f}). "
-    if len(highs_idx) == 2:
-        i1, i2 = highs_idx
-        p1, p2 = float(df["close"].iloc[i1]), float(df["close"].iloc[i2])
-        r1, r2 = float(rsi.iloc[i1]), float(rsi.iloc[i2])
-        if p2 > p1 and r2 < r1:
-            out["bearish"] = True
-            out["detail"] += f"Bear div: price HH ({p1:.0f}->{p2:.0f}) + RSI LH ({r1:.1f}->{r2:.1f}). "
-    return out
-
-# ================= PARAMS =================
-def load_params():
-    p = dict(DEFAULT_PARAMS)
+def jsonl_append(path: str, obj: Dict[str, Any]) -> None:
     try:
-        if os.path.exists(PARAMS_FILE):
-            with open(PARAMS_FILE, "r", encoding="utf-8") as f:
-                userp = json.load(f)
-            if isinstance(userp, dict):
-                p.update(userp)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f: f.write(json.dumps(obj) + "\n")
+    except Exception:
+        pass  # never crash engine due to logging
+
+def jsonl_tail(path: str, n: int = 500) -> List[Dict[str, Any]]:
+    if not os.path.exists(path): return []
+    try:
+        with open(path, "r", encoding="utf-8") as f: lines = f.readlines()[-n:]
+        out=[]
+        for ln in lines:
+            ln=ln.strip()
+            if not ln: continue
+            try: out.append(json.loads(ln))
+            except Exception: continue
+        return out
+    except Exception:
+        return []
+
+def tg_send(text: str) -> None:
+    if not (TG_BOT_TOKEN and TG_CHAT_ID): return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text},
+            timeout=8,
+        )
     except Exception:
         pass
-    return p
 
-# ================= CSV LOGGING =================
-def ensure_csv(path: str, header: list):
-    if not os.path.exists(path):
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(header)
+# ---------- indicators ----------
+def ema(s: pd.Series, span: int) -> pd.Series: return s.ewm(span=span, adjust=False).mean()
 
-def append_csv(path: str, row: dict, header: list):
-    ensure_csv(path, header)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        w.writerow({k: row.get(k, "") for k in header})
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0)
+    dn = (-d).clip(lower=0)
+    au = up.ewm(alpha=1/period, adjust=False).mean()
+    ad = dn.ewm(alpha=1/period, adjust=False).mean()
+    rs = au / ad.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-SIGNAL_HEADER = [
-    "ts_utc","symbol","price","signal","confidence","reason",
-    "rsi_5m","rsi_1h","atr_5m","htf_bias","trend_1h","trend_6h",
-    "momentum_30m","div_bull","div_bear"
-]
+def true_range(df: pd.DataFrame) -> pd.Series:
+    pc = df["close"].shift(1)
+    return pd.concat([(df["high"]-df["low"]), (df["high"]-pc).abs(), (df["low"]-pc).abs()], axis=1).max(axis=1)
 
-PAPER_HEADER = [
-    "ts_utc","trade_id","symbol","side","entry_price","exit_price","qty_btc",
-    "sl","tp","result","pnl_usd","pnl_pct","hold_minutes"
-]
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    return true_range(df).ewm(alpha=1/period, adjust=False).mean()
 
-# ================= PAPER SIM =================
-PAPER = {
-    "equity": None,          # USD
-    "pos": None,             # dict or None
-    "trade_id": 0,
-    "trades": [],            # recent
-}
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, sig: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    m = ema(close, fast) - ema(close, slow)
+    s = ema(m, sig)
+    return m, s, (m - s)
 
-def paper_init(params):
-    if PAPER["equity"] is None:
-        PAPER["equity"] = float(params["paper_start_usd"])
+def bollinger(close: pd.Series, period: int = 20, k: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    mid = close.rolling(period).mean()
+    sd = close.rolling(period).std()
+    return (mid - k*sd), mid, (mid + k*sd)
 
-def paper_maybe_open(signal_pack, params):
-    """
-    Open a paper trade only on BUY/SELL signals above min_confidence,
-    and only if no open position.
-    """
-    if PAPER["pos"] is not None:
-        return
+# ---------- coinbase ----------
+def cb_get(path: str, params: Optional[Dict[str, Any]]=None, timeout: int=12) -> Any:
+    r = requests.get(f"{CB_BASE}{path}", params=params, timeout=timeout, headers={"User-Agent":"btc-engine/2.0"})
+    if r.status_code != 200: raise RuntimeError(f"Coinbase HTTP {r.status_code}: {r.text[:200]}")
+    return r.json()
 
-    signal = signal_pack["signal"]
-    conf = float(signal_pack["confidence"])
-    if signal not in ("BUY", "SELL"):
-        return
-    if conf < float(params["min_confidence"]):
-        return
-    if signal_pack["sl_price"] is None or signal_pack["tp_price"] is None:
-        return
+def fetch_ticker() -> float:
+    return fnum(cb_get(f"/products/{PRODUCT}/ticker", timeout=8).get("price"))
 
-    price = float(signal_pack["price"])
-    equity = float(PAPER["equity"])
-    alloc = clamp(float(params["paper_risk_fraction"]), 0.05, 1.0) * equity
-    qty = alloc / price
+def fetch_candles(gran: int, limit: int = 240) -> pd.DataFrame:
+    gran = snap_gran(int(gran))
+    end = utcnow()
+    start = end - timedelta(seconds=gran*limit)
+    raw = cb_get(
+        f"/products/{PRODUCT}/candles",
+        params={"granularity":gran, "start":iso(start), "end":iso(end)},
+        timeout=14,
+    )
+    rows=[]
+    for it in (raw if isinstance(raw, list) else []):
+        if isinstance(it, (list, tuple)) and len(it) >= 6:
+            t, lo, hi, op, cl, vol = it[:6]
+            rows.append({
+                "time": datetime.fromtimestamp(int(t), tz=timezone.utc),
+                "low":float(lo),"high":float(hi),"open":float(op),"close":float(cl),"volume":float(vol)
+            })
+    if not rows: raise RuntimeError("No candles returned")
+    return pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
 
-    PAPER["trade_id"] += 1
-    PAPER["pos"] = {
-        "trade_id": PAPER["trade_id"],
-        "side": "LONG" if signal == "BUY" else "SHORT",
-        "entry": price,
-        "qty": qty,
-        "sl": float(signal_pack["sl_price"]),
-        "tp": float(signal_pack["tp_price"]),
-        "opened_ts": time.time(),
-        "opened_iso": now_utc_iso(),
-    }
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame()
+    d=df.set_index("time")
+    out=pd.concat([
+        d["open"].resample(rule).first(),
+        d["high"].resample(rule).max(),
+        d["low"].resample(rule).min(),
+        d["close"].resample(rule).last(),
+        d["volume"].resample(rule).sum(),
+    ], axis=1)
+    out.columns=["open","high","low","close","volume"]
+    return out.dropna().reset_index()
 
-def paper_maybe_close(latest_price: float):
-    pos = PAPER["pos"]
-    if pos is None:
-        return
+def df_to_candles(df: pd.DataFrame, limit: int = 180) -> List[Dict[str, Any]]:
+    if df is None or df.empty: return []
+    d=df.tail(limit)
+    vals = d["volume"] if "volume" in d.columns else [0.0]*len(d)
+    return [{
+        "time": iso(t.to_pydatetime() if hasattr(t,"to_pydatetime") else t),
+        "open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(v),
+    } for t,o,h,l,c,v in zip(d["time"], d["open"], d["high"], d["low"], d["close"], vals)]
 
-    side = pos["side"]
-    entry = float(pos["entry"])
-    sl = float(pos["sl"])
-    tp = float(pos["tp"])
-    qty = float(pos["qty"])
+# ---------- paper account ----------
+def paper_account() -> Dict[str, float]:
+    usd, btc = PAPER_START_USD, 0.0
+    for t in jsonl_tail(PAPER_LOG_PATH, n=10000):
+        side=str(t.get("side","")).upper()
+        qty=fnum(t.get("qty"),0.0); px=fnum(t.get("price"),0.0)
+        if qty<=0 or px<=0: continue
+        if side=="BUY":
+            cost=qty*px
+            if cost<=usd+1e-9: usd-=cost; btc+=qty
+        elif side=="SELL":
+            if qty<=btc+1e-12: usd+=qty*px; btc-=qty
+    return {"usd":usd,"btc":btc}
 
-    hit = None
-    if side == "LONG":
-        if latest_price <= sl: hit = "SL"
-        if latest_price >= tp: hit = "TP"
-        pnl_usd = (latest_price - entry) * qty
-        pnl_pct = (latest_price / entry) - 1.0
-    else:
-        if latest_price >= sl: hit = "SL"
-        if latest_price <= tp: hit = "TP"
-        pnl_usd = (entry - latest_price) * qty
-        pnl_pct = (entry / latest_price) - 1.0
+def paper_equity(price: float) -> Dict[str, float]:
+    a=paper_account()
+    eq=a["usd"]+a["btc"]*price
+    return {"usd":a["usd"],"btc":a["btc"],"equity":eq,"pl":eq-PAPER_START_USD}
 
-    if hit is None:
-        return
+# ---------- signal engine ----------
+def trend_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str:
+    def one(df: pd.DataFrame) -> str:
+        if df is None or df.empty or len(df) < 220: return "NEUTRAL"
+        c=df["close"]
+        e50=float(ema(c,50).iloc[-1]); e200=float(ema(c,200).iloc[-1])
+        if e50>e200: return "UP"
+        if e50<e200: return "DOWN"
+        return "NEUTRAL"
+    b1, b4 = one(df_1h), one(df_4h)
+    if b1==b4 and b1!="NEUTRAL": return b1
+    if b1!="NEUTRAL": return b1
+    if b4!="NEUTRAL": return b4
+    return "NEUTRAL"
 
-    PAPER["equity"] = float(PAPER["equity"]) + pnl_usd
-    hold_minutes = (time.time() - float(pos["opened_ts"])) / 60.0
+def score(df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame) -> Dict[str, Any]:
+    if df5 is None or df5.empty or len(df5) < 60:
+        return {"signal":"WAIT","confidence":0.0,"reason":"Not enough 5m candles"}
+    if df15 is None or df15.empty or len(df15) < 60:
+        return {"signal":"WAIT","confidence":0.0,"reason":"Not enough 15m candles"}
 
-    row = {
-        "ts_utc": now_utc_iso(),
-        "trade_id": pos["trade_id"],
-        "symbol": SYMBOL,
-        "side": side,
-        "entry_price": round(entry, 2),
-        "exit_price": round(latest_price, 2),
-        "qty_btc": qty,
-        "sl": round(sl, 2),
-        "tp": round(tp, 2),
-        "result": hit,
-        "pnl_usd": round(pnl_usd, 2),
-        "pnl_pct": round(pnl_pct * 100.0, 3),
-        "hold_minutes": round(hold_minutes, 2),
-    }
-    append_csv(PAPER_LOG, row, PAPER_HEADER)
+    df4h = resample_ohlcv(df1h, "4h") if df1h is not None and not df1h.empty else pd.DataFrame()
+    bias = trend_bias(df1h, df4h)
 
-    PAPER["trades"] = ([row] + PAPER["trades"])[:50]
-    PAPER["pos"] = None
+    price=float(df5["close"].iloc[-1])
+    r=float(rsi(df5["close"],14).iloc[-1])
 
-# ================= DECISION ENGINE =================
-def build_decision(c5, c1h, c6h, params):
-    price = float(c5["close"].iloc[-1])
+    m_line, s_line, _ = macd(df5["close"])
+    macd_up = (m_line.iloc[-2] < s_line.iloc[-2]) and (m_line.iloc[-1] > s_line.iloc[-1])
+    macd_dn = (m_line.iloc[-2] > s_line.iloc[-2]) and (m_line.iloc[-1] < s_line.iloc[-1])
 
-    rsi5s = compute_rsi(c5["close"], RSI_PERIOD)
-    rsi1hs = compute_rsi(c1h["close"], RSI_PERIOD)
-    atrs = compute_atr(c5, ATR_PERIOD)
+    bb_lo, _, bb_hi = bollinger(df5["close"],20,2.0)
+    bb_lo=float(bb_lo.iloc[-1]); bb_hi=float(bb_hi.iloc[-1])
 
-    rsi_5m = float(rsi5s.iloc[-1]) if not math.isnan(float(rsi5s.iloc[-1])) else None
-    rsi_1h = float(rsi1hs.iloc[-1]) if not math.isnan(float(rsi1hs.iloc[-1])) else None
-    atr_5m = float(atrs.iloc[-1]) if not math.isnan(float(atrs.iloc[-1])) else None
+    roc=float(df5["close"].pct_change(3).iloc[-1]) if len(df5)>=4 else 0.0
 
-    trend_1h = ema_trend(c1h["close"])
-    trend_6h = ema_trend(c6h["close"])
-    htf_bias = trend_1h if trend_1h == trend_6h else "NEUTRAL"
+    atr15=float(atr(df15,14).iloc[-1])
+    sl = price - 1.3*atr15 if atr15>0 else None
+    tp = price + 2.0*atr15 if atr15>0 else None
 
-    mom = momentum_lookback(c5["close"], n=6)
-    div = detect_rsi_divergence(c5)
+    # 180m window (36x 5m)
+    recent=df5.tail(36)
+    local_low=float(recent["low"].min()); local_high=float(recent["high"].max())
+    peak_watch = (price/local_low - 1.0) >= 0.006 if local_low>0 else False
+    dip_watch  = (local_high/price - 1.0) >= 0.006 if price>0 else False
 
-    # Confidence breakdown
-    w_htf = float(params["w_htf_alignment"])
-    w_rsi = float(params["w_rsi_signal"])
-    w_mom = float(params["w_momentum"])
-    w_div = float(params["w_divergence_bonus"])
+    score=0.0; why=[]
+    if bias=="UP": score+=18; why.append("bias UP (1h+4h)")
+    elif bias=="DOWN": score+=18; why.append("bias DOWN (1h+4h)")
+    else: score+=6; why.append("bias NEUTRAL")
 
-    conf_parts = {}
-    conf_parts["htf_alignment"] = w_htf if htf_bias in ("UP","DOWN") else w_htf * 0.33
+    if r<=30: score+=25; why.append(f"RSI oversold {r:.1f}")
+    elif r<=40: score+=12; why.append(f"RSI low {r:.1f}")
+    elif r>=70: score+=25; why.append(f"RSI overbought {r:.1f}")
+    elif r>=60: score+=12; why.append(f"RSI high {r:.1f}")
 
-    if rsi_5m is None:
-        conf_parts["rsi_signal"] = 0.0
-    else:
-        if htf_bias == "UP" and rsi_5m < float(params["rsi_oversold"]):
-            conf_parts["rsi_signal"] = w_rsi
-        elif htf_bias == "DOWN" and rsi_5m > float(params["rsi_overbought"]):
-            conf_parts["rsi_signal"] = w_rsi
-        else:
-            conf_parts["rsi_signal"] = w_rsi * 0.4
+    if macd_up: score+=14; why.append("MACD cross up")
+    if macd_dn: score+=14; why.append("MACD cross down")
 
-    if htf_bias == "UP":
-        conf_parts["momentum"] = w_mom if mom > 0 else w_mom * 0.4
-    elif htf_bias == "DOWN":
-        conf_parts["momentum"] = w_mom if mom < 0 else w_mom * 0.4
-    else:
-        conf_parts["momentum"] = w_mom * 0.4
+    if price<=bb_lo: score+=12; why.append("at/under lower BB")
+    if price>=bb_hi: score+=12; why.append("at/over upper BB")
 
-    div_bonus = 0.0
-    if div["bullish"]: div_bonus += w_div
-    if div["bearish"]: div_bonus += w_div
-    conf_parts["divergence_bonus"] = div_bonus
+    if abs(roc) >= 0.0025: score+=10; why.append(f"momentum {'up' if roc>0 else 'down'} {roc*100:.2f}%")
 
-    confidence = clamp(sum(conf_parts.values()), 1.0, 95.0)
+    score=clamp(score,0,100)
 
-    # Signal rules
-    signal = "WAIT"
-    reason = "No high-probability setup."
+    buy_ok  = (bias in ("UP","NEUTRAL")   and (r<=35 or macd_up) and roc>=-0.002) or (bias=="UP" and price<=bb_lo and r<=45)
+    sell_ok = (bias in ("DOWN","NEUTRAL") and (r>=65 or macd_dn) and roc<= 0.002) or (bias=="DOWN" and price>=bb_hi and r>=55)
 
-    if htf_bias == "UP" and rsi_5m is not None:
-        if (rsi_5m < float(params["rsi_oversold"])) and (mom > 0 or div["bullish"]):
-            signal = "BUY"
-            reason = "HTF UP + RSI oversold + confirmation (momentum/divergence)."
-
-    if htf_bias == "DOWN" and rsi_5m is not None:
-        if (rsi_5m > float(params["rsi_overbought"])) and (mom < 0 or div["bearish"]):
-            signal = "SELL"
-            reason = "HTF DOWN + RSI overbought + confirmation (momentum/divergence)."
-
-    # ATR SL/TP
-    sl_price = None
-    tp_price = None
-    if atr_5m is not None:
-        sl_mult = float(params["atr_sl_mult"])
-        tp_mult = float(params["atr_tp_mult"])
-        if signal == "BUY":
-            sl_price = price - sl_mult * atr_5m
-            tp_price = price + tp_mult * atr_5m
-        elif signal == "SELL":
-            sl_price = price + sl_mult * atr_5m
-            tp_price = price - tp_mult * atr_5m
-
-    watch = {
-        "peak_watch": bool(rsi_5m is not None and rsi_5m > 60 and mom > 0),
-        "dip_watch": bool(rsi_5m is not None and rsi_5m < 40 and mom < 0),
-    }
+    sig="WAIT"
+    if buy_ok and score>=CONF_BUY: sig="BUY"
+    elif sell_ok and score>=CONF_SELL: sig="SELL"
 
     return {
-        "price": price,
-        "signal": signal,
-        "confidence": round(confidence, 2),
-        "reason": reason,
-        "rsi_5m": None if rsi_5m is None else round(rsi_5m, 2),
-        "rsi_1h": None if rsi_1h is None else round(rsi_1h, 2),
-        "atr_5m": None if atr_5m is None else round(atr_5m, 2),
-        "sl_price": None if sl_price is None else round(sl_price, 2),
-        "tp_price": None if tp_price is None else round(tp_price, 2),
-        "trend_1h": trend_1h,
-        "trend_6h": trend_6h,
-        "htf_bias": htf_bias,
-        "momentum_30m": round(mom, 6),
-        "divergence": div,
-        "watch": watch,
-        "confidence_breakdown": conf_parts,
+        "signal": sig,
+        "confidence": float(round(score,2)),
+        "trend_bias": bias,
+        "rsi_5m": float(round(r,2)),
+        "momentum": float(round(roc,6)),
+        "peak_watch": bool(peak_watch),
+        "dip_watch": bool(dip_watch),
+        "atr_sl": None if sl is None else float(round(sl,2)),
+        "atr_tp": None if tp is None else float(round(tp,2)),
+        "reason": " • ".join(why[:6]) if why else "—",
     }
 
-# ================= STATE CACHE =================
-LAST_STATE = {"ok": False, "error": "Not ready"}
+def calibrate(n: int = 3000) -> Dict[str, Any]:
+    sigs = jsonl_tail(SIGNAL_LOG_PATH, n=n)
+    if len(sigs) < 200: return {"ok": False, "error": "Not enough signal history yet"}
+    sigs = sorted(sigs, key=lambda x: x.get("ts",""))
+    def sim(th: float) -> float:
+        cash=PAPER_START_USD; btc=0.0
+        for s in sigs:
+            px=fnum(s.get("price"),0.0); conf=fnum(s.get("confidence"),0.0); sg=str(s.get("signal","WAIT")).upper()
+            if px<=0: continue
+            if sg=="BUY"  and conf>=th and cash>1: btc=cash/px; cash=0.0
+            if sg=="SELL" and conf>=th and btc>0:  cash=btc*px; btc=0.0
+        last=fnum(sigs[-1].get("price"),0.0)
+        return cash + btc*(last if last>0 else 0.0)
+    best_th=None; best_eq=-1e18
+    for th in range(55,86):
+        eq=sim(float(th))
+        if eq>best_eq: best_eq=eq; best_th=float(th)
+    return {"ok": True, "recommended_threshold": best_th, "sim_equity": best_eq}
 
-# ================= API =================
-@app.get("/health")
-def health():
-    return {"ok": True, "service": "btc-engine", "time": now_utc_iso()}
+# ---------- api ----------
+app = FastAPI(title="BTC AI Engine", version="2.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-@app.get("/state")
-def state():
-    return LAST_STATE
+LOCK = threading.Lock()
+STATE: Dict[str, Any] = {
+    "ok": False,
+    "ts": iso(utcnow()),
+    "src": "Coinbase",
+    "product": PRODUCT,
+    "price": None,
+    "signal": "WAIT",
+    "confidence": 0.0,
+    "trend_bias": "NEUTRAL",
+    "rsi_5m": None,
+    "momentum": 0.0,
+    "peak_watch": False,
+    "dip_watch": False,
+    "reason": "Starting…",
+    "atr_sl": None,
+    "atr_tp": None,
+    "candles_15m": [],
+    "candles_5m": [],
+    "paper": {"usd": PAPER_START_USD, "btc": 0.0, "equity": PAPER_START_USD, "pl": 0.0},
+    "calibration": {"ok": False},
+}
 
-@app.get("/recent_signals")
-def recent_signals(limit: int = 50):
-    # Return last N rows from signals.csv (if present)
-    if not os.path.exists(SIGNAL_LOG):
-        return {"ok": True, "rows": []}
-    try:
-        df = pd.read_csv(SIGNAL_LOG).tail(int(clamp(limit, 1, 500)))
-        return {"ok": True, "rows": df.to_dict(orient="records")}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+_last_alert_at = 0.0
+_last_alert_key = ""
+_cache = {"ticker_ts":0.0,"price":None,"c5_ts":0.0,"c15_ts":0.0,"c1h_ts":0.0,"df5":None,"df15":None,"df1h":None}
 
-@app.get("/paper_trades")
-def paper_trades(limit: int = 50):
-    if not os.path.exists(PAPER_LOG):
-        return {"ok": True, "rows": []}
-    try:
-        df = pd.read_csv(PAPER_LOG).tail(int(clamp(limit, 1, 500)))
-        return {"ok": True, "rows": df.to_dict(orient="records")}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+def loop() -> None:
+    global _last_alert_at, _last_alert_key
+    g5, g15, g1h = snap_gran(GRAN_5M), snap_gran(GRAN_15M), snap_gran(GRAN_1H)
+    if (g5,g15,g1h)!=(GRAN_5M,GRAN_15M,GRAN_1H):
+        tg_send(f"⚠️ Granularity adjusted: 5m {GRAN_5M}->{g5}, 15m {GRAN_15M}->{g15}, 1h {GRAN_1H}->{g1h}")
 
-# ================= LOOP =================
-def main_loop():
-    global LAST_STATE
     while True:
-        params = load_params()
-        paper_init(params)
-
         try:
-            c5 = fetch_candles(G_5M, limit=300)
-            c1h = fetch_candles(G_1H, limit=300)
-            c6h = fetch_candles(G_6H, limit=300)
+            now=time.time()
+            if now-_cache["ticker_ts"]>=5:
+                px=fetch_ticker()
+                if px and px>0: _cache["price"]=float(px); _cache["ticker_ts"]=now
 
-            if c5.empty or c1h.empty or c6h.empty:
-                LAST_STATE = {"ok": False, "error": "Empty candle feed from Coinbase."}
-                time.sleep(5)
-                continue
+            if now-_cache["c5_ts"]>=30:
+                _cache["df5"]=fetch_candles(g5, 240); _cache["c5_ts"]=now
+            if now-_cache["c15_ts"]>=45:
+                _cache["df15"]=fetch_candles(g15, 240); _cache["c15_ts"]=now
+            if now-_cache["c1h_ts"]>=120:
+                _cache["df1h"]=fetch_candles(g1h, 400); _cache["c1h_ts"]=now
 
-            d = build_decision(c5, c1h, c6h, params)
+            df5, df15, df1h = _cache["df5"], _cache["df15"], _cache["df1h"]
+            s = score(df5, df15, df1h)
 
-            # --- Log the signal snapshot every loop (so you can calibrate) ---
-            row = {
-                "ts_utc": now_utc_iso(),
-                "symbol": SYMBOL,
-                "price": d["price"],
-                "signal": d["signal"],
-                "confidence": d["confidence"],
-                "reason": d["reason"],
-                "rsi_5m": d["rsi_5m"],
-                "rsi_1h": d["rsi_1h"],
-                "atr_5m": d["atr_5m"],
-                "htf_bias": d["htf_bias"],
-                "trend_1h": d["trend_1h"],
-                "trend_6h": d["trend_6h"],
-                "momentum_30m": d["momentum_30m"],
-                "div_bull": bool(d["divergence"].get("bullish")),
-                "div_bear": bool(d["divergence"].get("bearish")),
-            }
-            append_csv(SIGNAL_LOG, row, SIGNAL_HEADER)
+            price = _cache["price"]
+            if (price is None or not (price>0)) and df5 is not None and not df5.empty:
+                price=float(df5["close"].iloc[-1])
 
-            # --- Paper sim: open/close based on the same rules ---
-            paper_maybe_close(float(d["price"]))
-            paper_maybe_open(d, params)
+            paper = paper_equity(float(price) if price else 0.0)
 
-            LAST_STATE = {
+            new = {
                 "ok": True,
-                "time": now_utc_iso(),
+                "ts": iso(utcnow()),
                 "src": "Coinbase",
-                **d,
-                "params": {k: params[k] for k in [
-                    "min_confidence","atr_sl_mult","atr_tp_mult",
-                    "rsi_oversold","rsi_overbought",
-                    "w_htf_alignment","w_rsi_signal","w_momentum","w_divergence_bonus"
-                ]},
-                "paper": {
-                    "equity": round(float(PAPER["equity"]), 2),
-                    "open_position": PAPER["pos"],
-                    "recent_trades": PAPER["trades"],
-                }
+                "product": PRODUCT,
+                "price": float(price) if price else None,
+                **s,
+                "candles_15m": df_to_candles(df15, 180),
+                "candles_5m": df_to_candles(df5, 180),
+                "paper": {"usd": round(paper["usd"],2), "btc": round(paper["btc"],8), "equity": round(paper["equity"],2), "pl": round(paper["pl"],2)},
             }
+
+            jsonl_append(SIGNAL_LOG_PATH, {
+                "ts":new["ts"],"price":new["price"],"signal":new["signal"],"confidence":new["confidence"],
+                "trend_bias":new["trend_bias"],"rsi_5m":new["rsi_5m"],"momentum":new["momentum"]
+            })
+
+            key=f"{new['signal']}|{int(new['confidence'])}|{new.get('peak_watch')}|{new.get('dip_watch')}|{new.get('trend_bias')}"
+            if key!=_last_alert_key and (now-_last_alert_at)>=COOLDOWN_SEC:
+                if new["signal"] in ("BUY","SELL") or ((new.get("peak_watch") or new.get("dip_watch")) and new["confidence"]>=CONF_WATCH):
+                    _last_alert_key=key; _last_alert_at=now
+                    px=new["price"]
+                    if px:
+                        tg_send(
+                            f"🧠 BTC Bot\nPrice: ${px:,.2f}\nSignal: {new['signal']} (conf {new['confidence']:.0f}%)\n"
+                            f"Bias: {new['trend_bias']} • RSI(5m): {new['rsi_5m']}\n{new['reason']}"
+                        )
+
+            with LOCK: STATE.update(new)
 
         except Exception as e:
-            LAST_STATE = {"ok": False, "error": str(e), "time": now_utc_iso()}
+            with LOCK:
+                STATE["ok"]=False
+                STATE["ts"]=iso(utcnow())
+                STATE["reason"]=f"Engine error: {e}"
 
-        time.sleep(5)
+        time.sleep(POLL_SEC)
 
-# Run loop when this file starts (Railway/uvicorn will import module)
-import threading
-threading.Thread(target=main_loop, daemon=True).start()
+# start loop (can disable for local tests)
+if os.getenv("DISABLE_LOOP","0") != "1":
+    threading.Thread(target=loop, daemon=True).start()
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    with LOCK: st=dict(STATE)
+    return {"ok": True, "engine_ok": bool(st.get("ok")), "ts": st.get("ts"), "product": st.get("product")}
+
+@app.get("/state")
+def state() -> Dict[str, Any]:
+    with LOCK: return dict(STATE)
+
+@app.get("/explain")
+def explain() -> Dict[str, Any]:
+    with LOCK: st=dict(STATE)
+    keys=["ok","signal","confidence","trend_bias","rsi_5m","momentum","peak_watch","dip_watch","atr_sl","atr_tp","reason"]
+    return {k: st.get(k) for k in keys}
+
+@app.post("/paper/log")
+def paper_log(payload: Dict[str, Any]) -> Dict[str, Any]:
+    side=str(payload.get("side","")).upper()
+    qty=fnum(payload.get("qty"),0.0)
+    price=fnum(payload.get("price"),0.0)
+    note=str(payload.get("note","")).strip()
+    with LOCK: px=fnum(STATE.get("price"),0.0)
+    if price<=0 and px>0: price=px
+    if side not in ("BUY","SELL") or qty<=0 or price<=0:
+        return {"ok": False, "error": "Need side BUY/SELL, qty>0, price>0"}
+    obj={"ts":iso(utcnow()),"side":side,"qty":qty,"price":price,"note":note}
+    jsonl_append(PAPER_LOG_PATH,obj)
+    return {"ok": True, "logged": obj, "paper": paper_equity(price)}
+
+@app.post("/real/log")
+def real_log(payload: Dict[str, Any]) -> Dict[str, Any]:
+    side=str(payload.get("side","")).upper()
+    qty=fnum(payload.get("qty"),0.0)
+    price=fnum(payload.get("price"),0.0)
+    note=str(payload.get("note","")).strip()
+    with LOCK: px=fnum(STATE.get("price"),0.0)
+    if price<=0 and px>0: price=px
+    if side not in ("BUY","SELL") or qty<=0 or price<=0:
+        return {"ok": False, "error": "Need side BUY/SELL, qty>0, price>0"}
+    obj={"ts":iso(utcnow()),"side":side,"qty":qty,"price":price,"note":note}
+    jsonl_append(REAL_LOG_PATH,obj)
+    return {"ok": True, "logged": obj}
+
+@app.get("/trades")
+def trades() -> Dict[str, Any]:
+    with LOCK: px=fnum(STATE.get("price"),0.0)
+    return {
+        "ok": True,
+        "paper": paper_equity(px if px>0 else 0.0),
+        "paper_trades": jsonl_tail(PAPER_LOG_PATH, 200),
+        "real_trades": jsonl_tail(REAL_LOG_PATH, 200),
+    }
+
+@app.post("/calibrate")
+def calibrate_endpoint(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    n = int(payload.get("n", 3000)) if isinstance(payload, dict) else 3000
+    rec = calibrate(n=n)
+    with LOCK: STATE["calibration"]=rec
+    return rec
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT","8080")))
