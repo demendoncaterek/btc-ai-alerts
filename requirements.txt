@@ -1,8 +1,13 @@
-fastapi>=0.110
-uvicorn[standard]>=0.27
-requests>=2.31
-pandas>=2.2
-numpy>=1.26
-plotly>=5.20
-streamlit>=1.35
-streamlit-autorefresh>=1.0.1
+# Core
+requests==2.32.3
+
+# UI
+streamlit==1.49.0
+streamlit-autorefresh==1.0.1
+pandas==2.2.3
+numpy==1.26.4
+plotly==5.24.1
+
+# Optional (only needed if YOU still run a FastAPI engine version)
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
