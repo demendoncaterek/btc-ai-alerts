@@ -1,210 +1,155 @@
-#!/usr/bin/env python3
-"""
-btc_ui.py
-
-Streamlit UI for the BTC engine.
-
-Streamlit usually won't give you a true /trades route.
-This UI uses a query param instead:
-  - Overview: /
-  - Trades:   /?page=trades
-"""
-
 import os
+import requests
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-except Exception:
-    st_autorefresh = None
-
-
+# ================= CONFIG =================
 ENGINE_URL = os.getenv("ENGINE_URL", "http://localhost:8080").rstrip("/")
-REFRESH_MS = int(os.getenv("REFRESH_MS", "15000"))
+REFRESH_MS = int(os.getenv("REFRESH_MS", "15000"))  # 15s
+# ==========================================
 
 st.set_page_config(page_title="BTC AI Dashboard", layout="wide")
 
-qp = st.query_params
-page = (qp.get("page", "overview") or "overview").lower()
+# ================= NAV =================
+page = st.query_params.get("page", "overview")
 
-st.title("🧠 BTC AI Dashboard")
-st.caption("15m execution • 1h+4h bias • ATR SL/TP • Telegram /status + /explain")
+nav1, nav2 = st.columns(2)
+with nav1:
+    if st.button("🏠 Overview"):
+        st.query_params.clear()
+        st.rerun()
 
-cols_top = st.columns([1, 1, 3])
-with cols_top[0]:
-    st.page_link(".", label="🏠 Overview")
-with cols_top[1]:
-    st.page_link("?page=trades", label="📒 Trades Journal")
+with nav2:
+    if st.button("📒 Trades Journal"):
+        st.query_params["page"] = "trades"
+        st.rerun()
 
-if st_autorefresh:
-    st_autorefresh(interval=REFRESH_MS, key="btc_autorefresh")
+st.divider()
 
+# ================= DATA =================
+def fetch_state():
+    try:
+        r = requests.get(f"{ENGINE_URL}/state", timeout=6)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-@st.cache_data(ttl=8)
-def fetch_json(path: str):
-    r = requests.get(f"{ENGINE_URL}{path}", timeout=8)
-    return r.status_code, r.json()
+def fetch_health():
+    try:
+        r = requests.get(f"{ENGINE_URL}/health", timeout=6)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
+state = fetch_state()
 
-code, state = fetch_json("/state")
-
-if not isinstance(state, dict) or not state.get("ok"):
+# ================= ENGINE NOT READY =================
+if not state.get("ok"):
+    st.title("🧠 BTC AI Dashboard")
     st.warning("⏳ Engine not ready yet.")
-    st.write("Check ENGINE_URL and that engine /health is reachable.")
+    st.caption("Check ENGINE_URL and that engine /health is reachable.")
+
     with st.expander("Debug", expanded=True):
         st.write("ENGINE_URL:", ENGINE_URL)
-        if isinstance(state, dict):
-            st.json(state)
-        else:
-            st.write("Bad response:", code, state)
+        st.json(state)
 
         if st.button("Ping /health"):
-            try:
-                c2, j2 = fetch_json("/health")
-                st.write("HTTP", c2)
-                st.json(j2)
-            except Exception as e:
-                st.error(str(e))
+            st.json(fetch_health())
+
     st.stop()
 
+# ================= OVERVIEW PAGE =================
+if page == "overview":
+    st.title("🧠 BTC AI Dashboard")
+    st.caption("15m execution • 1h+4h bias • ATR SL/TP • Telegram alerts")
 
-price = float(state.get("price") or 0.0)
-signal = state.get("signal", "WAIT")
-conf = float(state.get("confidence") or 0.0)
-trend_1h = state.get("trend_1h", "UNKNOWN")
-trend_4h = state.get("trend_4h", "UNKNOWN")
-rsi_base = state.get("rsi_base")
-atr = state.get("atr")
-suggested = state.get("suggested") or {}
-sl = suggested.get("sl")
-tp = suggested.get("tp")
+    cols = st.columns(4)
+    cols[0].metric("BTC Price", f"${state['price']:,.2f}")
+    cols[1].metric("RSI (5m)", state.get("rsi_5m", "--"))
+    cols[2].metric("Signal", state["signal"])
+    cols[3].metric("Confidence", f"{state['confidence']}%")
 
-dip_watch = state.get("dip_watch")
-peak_watch = state.get("peak_watch")
+    if state["signal"] == "WAIT":
+        st.warning("⏳ Waiting for strong setup")
+    elif state["signal"] == "BUY":
+        st.success("🟢 BUY setup detected")
+    elif state["signal"] == "SELL":
+        st.error("🔴 SELL setup detected")
 
-candles = state.get("candles") or []
-markers = state.get("markers") or []
+    st.subheader("📊 BTC Candlesticks")
 
+    candles = pd.DataFrame(state["candles"])
+    fig = go.Figure()
 
-if page != "trades":
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("BTC Price", f"${price:,.2f}")
-    c2.metric("RSI (base)", f"{rsi_base:.1f}" if rsi_base is not None else "—")
-    c3.metric("Signal", signal)
-    c4.metric("Confidence", f"{conf:.0%}")
-    c5.metric("Bias (1h / 4h)", f"{trend_1h} / {trend_4h}")
+    fig.add_trace(go.Candlestick(
+        x=candles["time"],
+        open=candles["open"],
+        high=candles["high"],
+        low=candles["low"],
+        close=candles["close"],
+        name="BTC"
+    ))
 
-    if conf >= 0.72 and signal in ("BUY", "SELL"):
-        st.success(f"High-confidence setup: **{signal}** ({conf:.0%})")
-    elif conf >= 0.60:
-        st.warning("⚠️ Medium-confidence setup")
-    else:
-        st.info("⏳ Waiting for stronger conditions")
-
-    if peak_watch:
-        st.warning(f"📈 Peak watch: price near {peak_watch.get('window_min')}m high.")
-    if dip_watch:
-        st.warning(f"📉 Dip watch: price near {dip_watch.get('window_min')}m low.")
-
-    if sl and tp and atr:
-        st.caption(f"Suggested SL/TP (ATR): SL **{sl:,.2f}** • TP **{tp:,.2f}** • ATR(base) {atr:.2f}")
-
-    if candles:
-        df = pd.DataFrame(candles)
-        df["dt"] = pd.to_datetime(df["t"], unit="s")
-        df = df.sort_values("dt")
-
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=df["dt"], open=df["o"], high=df["h"], low=df["l"], close=df["c"], name="BTC"
+    # Momentum arrows
+    if "bullish_marks" in state:
+        fig.add_trace(go.Scatter(
+            x=state["bullish_marks"]["x"],
+            y=state["bullish_marks"]["y"],
+            mode="markers",
+            marker=dict(color="green", symbol="triangle-up", size=10),
+            name="Bullish momentum"
         ))
 
-        if markers:
-            mdf = pd.DataFrame(markers)
-            mdf["dt"] = pd.to_datetime(mdf["t"], unit="s")
-            bull = mdf[mdf["kind"] == "bull"]
-            bear = mdf[mdf["kind"] == "bear"]
+    if "bearish_marks" in state:
+        fig.add_trace(go.Scatter(
+            x=state["bearish_marks"]["x"],
+            y=state["bearish_marks"]["y"],
+            mode="markers",
+            marker=dict(color="red", symbol="triangle-down", size=10),
+            name="Bearish momentum"
+        ))
 
-            if not bull.empty:
-                fig.add_trace(go.Scatter(
-                    x=bull["dt"], y=bull["price"], mode="markers",
-                    marker=dict(symbol="arrow-up", size=10),
-                    name="Bullish momentum"
-                ))
-            if not bear.empty:
-                fig.add_trace(go.Scatter(
-                    x=bear["dt"], y=bear["price"], mode="markers",
-                    marker=dict(symbol="arrow-down", size=10),
-                    name="Bearish momentum"
-                ))
+    fig.update_layout(
+        height=500,
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark"
+    )
 
-        fig.update_layout(
-            height=520,
-            margin=dict(l=10, r=10, t=30, b=10),
-            xaxis_rangeslider_visible=False,
-            legend_orientation="h",
-        )
+    st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("📊 BTC Candlesticks")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No candle data yet.")
+# ================= TRADES PAGE =================
+elif page == "trades":
+    st.title("📒 Trade Journal")
+    st.caption("Paper + Real trades (logged by engine)")
 
-    st.divider()
-    st.subheader("🧾 Paper Trading Controls (optional)")
-    cA, cB, cC = st.columns([1, 1, 2])
-    with cA:
-        if st.button("Paper BUY (all USD)"):
-            try:
-                r = requests.post(f"{ENGINE_URL}/paper/buy", timeout=8)
-                st.json(r.json())
-                st.cache_data.clear()
-            except Exception as e:
-                st.error(str(e))
-    with cB:
-        if st.button("Paper SELL (all BTC)"):
-            try:
-                r = requests.post(f"{ENGINE_URL}/paper/sell", timeout=8)
-                st.json(r.json())
-                st.cache_data.clear()
-            except Exception as e:
-                st.error(str(e))
-    with cC:
-        paper = state.get("paper") or {}
-        st.caption(f"Paper equity: ${paper.get('equity', 0):,.2f} • USD: ${paper.get('usd', 0):,.2f} • BTC: {paper.get('btc', 0):.6f}")
+    col1, col2 = st.columns(2)
 
-else:
-    st.subheader("📒 Trades Journal")
-
-    code_t, trades = fetch_json("/trades")
-    if code_t != 200 or not isinstance(trades, dict) or not trades.get("ok"):
-        st.error("Could not load /trades from engine.")
-        st.write("HTTP", code_t)
-        st.json(trades)
-        st.stop()
-
-    paper = trades.get("paper") or []
-    real = trades.get("real") or []
-
-    tab1, tab2 = st.tabs(["Paper trades", "Logged real trades (manual)"])
-
-    with tab1:
-        if not paper:
+    with col1:
+        st.subheader("🧪 Paper Trading")
+        paper = pd.DataFrame(state.get("paper_trades", []))
+        if paper.empty:
             st.info("No paper trades yet.")
         else:
-            pdf = pd.DataFrame(paper)
-            st.dataframe(pdf, use_container_width=True, hide_index=True)
-            st.download_button("Download paper trades CSV", pdf.to_csv(index=False), file_name="paper_trades.csv")
+            st.dataframe(paper, use_container_width=True)
 
-    with tab2:
-        if not real:
-            st.info("No logged real trades yet.")
+    with col2:
+        st.subheader("💰 Real Trades (Logged)")
+        real = pd.DataFrame(state.get("real_trades", []))
+        if real.empty:
+            st.info("No real trades logged yet.")
         else:
-            rdf = pd.DataFrame(real)
-            st.dataframe(rdf, use_container_width=True, hide_index=True)
-            st.download_button("Download real trades CSV", rdf.to_csv(index=False), file_name="real_trades.csv")
+            st.dataframe(real, use_container_width=True)
 
-    st.caption("Bookmark: **/?page=trades** (Streamlit routing limitation).")
+    st.divider()
+
+    st.subheader("📈 P/L Summary")
+    cols = st.columns(4)
+    cols[0].metric("Paper Equity", f"${state['paper_equity']:,.2f}")
+    cols[1].metric("Paper P/L", f"${state['paper_pl']:,.2f}")
+    cols[2].metric("Real BTC", f"{state['real_btc']:.6f}")
+    cols[3].metric("Unrealized P/L", f"${state['real_unrealized_pl']:,.2f}")
+
+# ================= FALLBACK =================
+else:
+    st.error("Unknown page")
