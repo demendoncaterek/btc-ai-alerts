@@ -1,139 +1,220 @@
 import os
 import requests
 import streamlit as st
+import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime
 
-# ================= CONFIG =================
+# -------------------------
+# CONFIG
+# -------------------------
 ENGINE_URL = os.getenv("ENGINE_URL", "http://localhost:8080").rstrip("/")
-REFRESH_MS = int(os.getenv("REFRESH_MS", "15000"))  # 15s
-# ==========================================
+REFRESH_MS = int(os.getenv("REFRESH_MS", "15000"))
 
 st.set_page_config(page_title="BTC AI Dashboard", layout="wide")
 
-st.title("🧠 BTC AI Dashboard")
-st.caption("5m + 1h bias • Telegram alerts • Paper + Real (logged) P/L")
-
-# ---------- Auto refresh (safe) ----------
+# Auto-refresh
 try:
     from streamlit_autorefresh import st_autorefresh
     st_autorefresh(interval=REFRESH_MS, key="btc_autorefresh")
 except Exception:
     pass
 
-
-# ============== DATA FETCH ==============
 def fetch_state():
     try:
-        r = requests.get(f"{ENGINE_URL}/state", timeout=6)
+        r = requests.get(f"{ENGINE_URL}/state", timeout=8)
         return r.json()
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 state = fetch_state()
 
-# ---------- If engine not ready ----------
-if not state.get("ok"):
-    st.warning("⏳ Waiting for engine data…")
-    st.caption("Market will display once engine responds.")
+# Query param page (Streamlit-safe “/trades” equivalent)
+qp = st.query_params
+page = (qp.get("page", "dashboard") or "dashboard").lower()
 
-    with st.expander("Debug (click to open)", expanded=True):
+# Top header always
+st.title("🧠 BTC AI Dashboard")
+st.caption("15m execution • 1h+4h bias • ATR SL/TP • Telegram /status + /explain")
+
+# If engine not ready, still show debug (don’t blank out)
+if not state.get("ok"):
+    st.warning("⏳ Engine not ready yet.")
+    st.write("Check ENGINE_URL and that engine /health is reachable.")
+    with st.expander("Debug", expanded=True):
         st.write("ENGINE_URL:", ENGINE_URL)
-        st.error(state.get("error", "No state yet"))
-        if st.button("Ping engine /health"):
+        st.json(state)
+        if st.button("Ping /health"):
             try:
-                r = requests.get(f"{ENGINE_URL}/health", timeout=6)
+                r = requests.get(f"{ENGINE_URL}/health", timeout=8)
                 st.json(r.json())
             except Exception as e:
                 st.error(str(e))
     st.stop()
 
-# ================= MARKET METRICS =================
-price = state.get("price")
-rsi = state.get("rsi")
-confidence = state.get("confidence", 0)
-trend = state.get("trend", "WAIT")
-time_str = state.get("time", "--")
-candles = state.get("candles", [])
-momentum = state.get("momentum", 0)
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("BTC Price", f"${price:,.2f}" if price else "--")
-c2.metric("RSI (5m)", round(rsi, 1) if rsi else "--")
-c3.metric("Trend", trend)
-c4.metric("Confidence", f"{confidence}%")
-
-st.caption(f"Last update: {time_str} • src=Coinbase")
-
-# ================= SIGNAL STATUS =================
-if confidence >= 80:
-    st.success("🔥 High-confidence setup detected")
-elif confidence >= 60:
-    st.warning("⚠️ Medium-confidence setup")
+# Simple nav (works on mobile too)
+nav = st.radio("View", ["Dashboard", "Trades"], horizontal=True, index=0 if page != "trades" else 1)
+if nav == "Trades":
+    st.query_params["page"] = "trades"
+    page = "trades"
 else:
-    st.info("⏳ Waiting for strong conditions")
+    st.query_params["page"] = "dashboard"
+    page = "dashboard"
 
-# ================= CANDLE CHART =================
-st.subheader("📊 BTC Candlesticks")
+# Convenience link (bookmark this for “/trades”)
+st.caption("Bookmark Trades: add `?page=trades` to your URL.")
 
-if not candles:
-    st.info("Waiting for candle data…")
+# -------------------------
+# Shared fields
+# -------------------------
+price = float(state.get("price", 0))
+signal = state.get("signal", "WAIT")
+confidence = int(state.get("confidence", 0))
+bias = state.get("bias", "NEUTRAL")
+bias1 = state.get("bias_1h", "?")
+bias4 = state.get("bias_4h", "?")
+rsi_v = state.get("rsi", None)
+atr_v = state.get("atr", None)
+sl = state.get("sl", None)
+tp = state.get("tp", None)
+rr = state.get("rr", None)
+
+paper = state.get("paper_summary", {}) or {}
+real = state.get("real_summary", {}) or {}
+
+# -------------------------
+# DASHBOARD
+# -------------------------
+if page == "dashboard":
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("BTC Price", f"${price:,.2f}")
+    c2.metric("RSI (15m)", f"{rsi_v}")
+    c3.metric("Bias", f"{bias} (1h={bias1}, 4h={bias4})")
+    c4.metric("Signal", signal)
+    c5.metric("Confidence", f"{confidence}%")
+
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Paper Equity", f"${paper.get('equity', 0):,.2f}")
+    a2.metric("Paper P/L", f"${paper.get('pnl', 0):,.2f}")
+    a3.metric("Logged Real Unrealized P/L", f"${real.get('unrealized', 0):,.2f}")
+
+    # SL/TP panel (suggestion only)
+    st.subheader("🎯 Risk Plan (Suggestion)")
+    if sl is not None and tp is not None:
+        st.success(f"Suggested SL: ${sl:,.2f}  |  TP: ${tp:,.2f}  |  R:R≈{rr}")
+    else:
+        st.info("No SL/TP suggestion right now (no active BUY/SELL setup).")
+
+    # Explain panel
+    st.subheader("🧠 Why it thinks this")
+    st.write(state.get("reason", ""))
+    with st.expander("Full confidence breakdown"):
+        for r in state.get("confidence_reasons", [])[:50]:
+            st.write(f"• {r}")
+
+    # Chart
+    st.subheader("📈 BTC Candlesticks (15m) + Momentum Arrows + Signals")
+    candles = state.get("candles", []) or []
+    events = state.get("events", []) or []
+    macd_hist_series = state.get("macd_hist_series", []) or []
+
+    if not candles:
+        st.info("Waiting for candle data…")
+    else:
+        df = pd.DataFrame(candles)
+        df["dt"] = pd.to_datetime(df["ts"], unit="s")
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Candlestick(
+                x=df["dt"],
+                open=df["open"],
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                name="BTC",
+            )
+        )
+
+        # Momentum arrows (like your old look): use MACD histogram sign per candle if available
+        if len(macd_hist_series) == len(df):
+            y_pos = df["low"] * 0.999  # arrows slightly below candle
+            colors = ["lime" if m > 0 else "red" for m in macd_hist_series]
+            symbols = ["triangle-up" if m > 0 else "triangle-down" for m in macd_hist_series]
+            fig.add_trace(
+                go.Scatter(
+                    x=df["dt"],
+                    y=y_pos,
+                    mode="markers",
+                    marker=dict(size=9, symbol=symbols, color=colors, opacity=0.85),
+                    name="Momentum",
+                    hoverinfo="skip",
+                )
+            )
+
+        # Event markers (BUY/SELL/CRAZY)
+        if events:
+            ev = pd.DataFrame(events)
+            ev["dt"] = pd.to_datetime(ev["ts"])
+
+            sym = []
+            col = []
+            for t in ev["type"]:
+                t = str(t).upper()
+                if t == "BUY":
+                    sym.append("triangle-up"); col.append("lime")
+                elif t == "SELL":
+                    sym.append("triangle-down"); col.append("red")
+                elif "DIP" in t:
+                    sym.append("triangle-left"); col.append("cyan")
+                elif "PEAK" in t:
+                    sym.append("triangle-right"); col.append("orange")
+                else:
+                    sym.append("circle"); col.append("white")
+
+            fig.add_trace(
+                go.Scatter(
+                    x=ev["dt"],
+                    y=ev["price"],
+                    mode="markers",
+                    marker=dict(size=14, symbol=sym, color=col),
+                    name="Signals",
+                    text=ev.get("label", ev["type"]),
+                    hovertemplate="%{text}<br>$%{y:,.2f}<br>%{x}<extra></extra>",
+                )
+            )
+
+        fig.update_layout(height=560, xaxis_rangeslider_visible=False, template="plotly_dark")
+        st.plotly_chart(fig, use_container_width=True)
+
+# -------------------------
+# TRADES JOURNAL
+# -------------------------
 else:
-    fig = go.Figure()
+    st.subheader("📒 Trade Journal")
 
-    # Candles
-    fig.add_trace(go.Candlestick(
-        x=[c["time"] for c in candles],
-        open=[c["open"] for c in candles],
-        high=[c["high"] for c in candles],
-        low=[c["low"] for c in candles],
-        close=[c["close"] for c in candles],
-        name="BTC"
-    ))
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("### 📄 Paper Trades")
+        ptrades = state.get("paper_trades", []) or []
+        if ptrades:
+            pdf = pd.DataFrame(ptrades)
+            st.dataframe(pdf, use_container_width=True, height=360)
+        else:
+            st.info("No paper trades logged yet.")
 
-    # ---------- Momentum arrows (subtle style) ----------
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
+    with colB:
+        st.markdown("### 🧾 Logged Real Trades (manual)")
+        rtrades = state.get("real_trades", []) or []
+        if rtrades:
+            rdf = pd.DataFrame(rtrades)
+            st.dataframe(rdf, use_container_width=True, height=360)
+        else:
+            st.info("No real trades logged yet. Use Telegram: /logbuy 100 or /logsell 100")
 
-    buy_x, buy_y = [], []
-    sell_x, sell_y = [], []
+    st.markdown("### Summary")
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Paper Equity", f"${paper.get('equity', 0):,.2f}")
+    s2.metric("Paper P/L", f"${paper.get('pnl', 0):,.2f}")
+    s3.metric("Logged Real Unrealized P/L", f"${real.get('unrealized', 0):,.2f}")
 
-    for i in range(2, len(candles)):
-        # Higher low = bullish momentum
-        if lows[i] > lows[i - 1] > lows[i - 2]:
-            buy_x.append(candles[i]["time"])
-            buy_y.append(lows[i] * 0.999)
-
-        # Lower high = bearish momentum
-        if highs[i] < highs[i - 1] < highs[i - 2]:
-            sell_x.append(candles[i]["time"])
-            sell_y.append(highs[i] * 1.001)
-
-    fig.add_trace(go.Scatter(
-        x=buy_x,
-        y=buy_y,
-        mode="markers",
-        marker=dict(symbol="triangle-up", color="lime", size=8),
-        name="Bullish momentum"
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=sell_x,
-        y=sell_y,
-        mode="markers",
-        marker=dict(symbol="triangle-down", color="red", size=8),
-        name="Bearish momentum"
-    ))
-
-    fig.update_layout(
-        template="plotly_dark",
-        height=450,
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=10, b=10)
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-# ================= FOOTER =================
-if st.button("🔄 Refresh Now"):
-    st.rerun()
+    st.caption("Tip: Bookmark this page using `?page=trades`.")
