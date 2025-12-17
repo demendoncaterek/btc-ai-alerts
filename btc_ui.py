@@ -86,6 +86,28 @@ if candles:
         ]
     )
 
+# === MOMENTUM ARROWS (MACD-based) ===
+if "macd_hist" in state:
+    macd_hist = state.get("macd_hist", 0)
+
+    arrow_symbol = "triangle-up" if macd_hist > 0 else "triangle-down"
+    arrow_color = "lime" if macd_hist > 0 else "red"
+
+    fig.add_trace(
+        go.Scatter(
+            x=[df["dt"].iloc[-1]],
+            y=[df["close"].iloc[-1]],
+            mode="markers",
+            marker=dict(
+                size=18,
+                symbol=arrow_symbol,
+                color=arrow_color,
+            ),
+            name="Momentum",
+            hovertemplate=f"Momentum: {'Bullish' if macd_hist > 0 else 'Bearish'}<extra></extra>",
+        )
+    )
+
     events = state.get("events", []) or []
     if events:
         ev = pd.DataFrame(events)
