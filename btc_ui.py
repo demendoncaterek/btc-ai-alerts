@@ -33,4 +33,15 @@ def fetch_state():
 state = fetch_state()
 
 if not state.get("ok"):
-    st.warning("⏳ Waiting for en
+    st.warning("⏳ Waiting for engine data…")
+    st.write("Make sure ENGINE_URL points to your engine and /health works.")
+    with st.expander("Debug (click to open)", expanded=True):
+        st.write("ENGINE_URL:", ENGINE_URL)
+        st.error(state.get("error", "No state yet"))
+        if st.button("Ping engine /health"):
+            try:
+                r = requests.get(f"{ENGINE_URL}/health", timeout=6)
+                st.json(r.json())
+            except Exception as e:
+                st.error(str(e))
+    st.stop()
