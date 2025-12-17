@@ -1,155 +1,136 @@
 import os
+import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
-import plotly.graph_objects as go
-from streamlit_autorefresh import st_autorefresh
 
-ENGINE_URL = os.getenv("ENGINE_URL", "").strip().rstrip("/")
-UI_REFRESH_MS = int(os.getenv("UI_REFRESH_MS", "5000"))
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+
+ENGINE_URL = os.getenv("ENGINE_URL", "http://localhost:8080").rstrip("/")
+REFRESH_MS = int(os.getenv("REFRESH_MS", "15000"))  # 15s
 
 st.set_page_config(page_title="BTC AI Dashboard", layout="wide")
+
 st.title("🧠 BTC AI Dashboard")
-st.caption("Short-term • AI-filtered • Telegram alerts • Paper + Real (logged) P/L")
+st.caption("5m + 1h bias • Telegram alerts • Paper + Real (logged) P/L")
 
-st_autorefresh(interval=UI_REFRESH_MS, key="btc_refresh")
+if st_autorefresh:
+    st_autorefresh(interval=REFRESH_MS, key="btc_autorefresh")
 
-def fetch_json(url: str, timeout=6):
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-def get_engine_state():
-    if not ENGINE_URL:
-        return None, "ENGINE_URL is not set."
+def fetch_state():
     try:
-        return fetch_json(f"{ENGINE_URL}/state", timeout=6), ""
+        r = requests.get(f"{ENGINE_URL}/state", timeout=6)
+        return r.json()
     except Exception as e:
-        return None, str(e)
+        return {"ok": False, "error": str(e)}
 
-def ping_health():
-    if not ENGINE_URL:
-        return None, "ENGINE_URL is not set."
-    try:
-        return fetch_json(f"{ENGINE_URL}/health", timeout=4), ""
-    except Exception as e:
-        return None, str(e)
+state = fetch_state()
 
-def render_candles_with_momentum(candles):
-    if not candles:
-        st.info("⏳ Waiting for candle data…")
-        return
-
-    x = [c["time"] for c in candles]
-    opens = [c["open"] for c in candles]
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    closes = [c["close"] for c in candles]
-
-    fig = go.Figure(
-        data=[go.Candlestick(x=x, open=opens, high=highs, low=lows, close=closes, name="BTC")]
-    )
-
-    # Momentum arrows (5-candle momentum)
-    up_x, up_y, dn_x, dn_y = [], [], [], []
-    for i in range(len(closes)):
-        if i < 5:
-            continue
-        prev = closes[i - 5]
-        if prev == 0:
-            continue
-        mom = (closes[i] - prev) / prev
-        if mom > 0.001:
-            up_x.append(x[i]); up_y.append(highs[i] * 1.0005)
-        elif mom < -0.001:
-            dn_x.append(x[i]); dn_y.append(lows[i] * 0.9995)
-
-    if up_x:
-        fig.add_trace(go.Scatter(x=up_x, y=up_y, mode="markers",
-                                 marker=dict(symbol="triangle-up", size=10),
-                                 name="Momentum ↑"))
-    if dn_x:
-        fig.add_trace(go.Scatter(x=dn_x, y=dn_y, mode="markers",
-                                 marker=dict(symbol="triangle-down", size=10),
-                                 name="Momentum ↓"))
-
-    fig.update_layout(
-        height=380,
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=10, b=10),
-        legend=dict(orientation="h"),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-state, err = get_engine_state()
-
-with st.expander("Debug (click to open)", expanded=not bool(state)):
-    st.write(f"ENGINE_URL: {ENGINE_URL or '(not set)'}")
-    cdbg1, cdbg2 = st.columns([1, 3])
-    with cdbg1:
+if not state.get("ok"):
+    st.warning("⏳ Waiting for engine data…")
+    st.write("Make sure ENGINE_URL points to your engine and /health works.")
+    with st.expander("Debug (click to open)", expanded=True):
+        st.write("ENGINE_URL:", ENGINE_URL)
+        st.error(state.get("error", "No state yet"))
         if st.button("Ping engine /health"):
-            data, herr = ping_health()
-            if herr:
-                st.error(herr)
-            else:
-                st.success("Health OK")
-                st.json(data)
-    with cdbg2:
-        if err:
-            st.error(err)
-        else:
-            st.caption("Engine reachable.")
-
-if not state:
-    st.info("⏳ Waiting for engine data…")
+            try:
+                r = requests.get(f"{ENGINE_URL}/health", timeout=6)
+                st.json(r.json())
+            except Exception as e:
+                st.error(str(e))
     st.stop()
 
-if state.get("error"):
-    st.error(f"Engine error: {state['error']}")
+price = float(state.get("price", 0))
+signal = state.get("signal", "WAIT")
+confidence = int(state.get("confidence", 0))
+trend_bias = state.get("trend_bias", "NEUTRAL")
+base_tf = int(state.get("base_granularity", 300)) // 60
+rsi_v = state.get("base_rsi", None)
+notes = state.get("notes", "")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("BTC Price", f"${state.get('price', 0):,.2f}")
-c2.metric("RSI (1m)", state.get("rsi", 0))
-c3.metric("Trend", state.get("trend", "WAIT"))
-c4.metric("🧠 Confidence", f"{state.get('confidence', 0)}%")
-st.caption(f"Last update: {state.get('time','--:--:--')}  •  {state.get('notes','')}")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("BTC Price", f"${price:,.2f}")
+c2.metric(f"RSI ({base_tf}m)", f"{rsi_v}")
+c3.metric("Trend (1h bias)", trend_bias)
+c4.metric("Signal", signal)
+c5.metric("Confidence", f"{confidence}%")
+st.caption(f"Last update: {state.get('time')} • {notes}")
 
-conf = state.get("confidence", 0)
-if conf >= 75:
-    st.success("🔥 High-quality setup")
-elif conf >= 60:
-    st.warning("⚠️ Medium-quality signal")
+paper = state.get("paper_summary", {}) or {}
+real = state.get("real_summary", {}) or {}
+p1, p2, p3 = st.columns(3)
+p1.metric("Paper Equity", f"${paper.get('equity', 0):,.2f}")
+p2.metric("Paper P/L", f"${paper.get('pnl', 0):,.2f}")
+p3.metric("Logged Real Unrealized P/L", f"${real.get('unrealized', 0):,.2f}")
+
+st.subheader("📈 BTC Candlesticks (5m) + Momentum/Signal Markers")
+candles = state.get("candles", []) or []
+
+if candles:
+    df = pd.DataFrame(candles)
+    df["dt"] = pd.to_datetime(df["ts"], unit="s")
+
+    fig = go.Figure(
+        data=[
+            go.Candlestick(
+                x=df["dt"],
+                open=df["open"],
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                name="BTC",
+            )
+        ]
+    )
+
+    events = state.get("events", []) or []
+    if events:
+        ev = pd.DataFrame(events)
+        ev["dt"] = pd.to_datetime(ev["ts"])
+        sym = []
+        text = []
+        for t, lbl in zip(ev["type"], ev.get("label", ev["type"])):
+            t = str(t).upper()
+            if t == "BUY":
+                sym.append("triangle-up")
+            elif t == "SELL":
+                sym.append("triangle-down")
+            elif t == "DIP":
+                sym.append("triangle-left")
+            elif t == "PEAK":
+                sym.append("triangle-right")
+            else:
+                sym.append("circle")
+            text.append(lbl)
+
+        fig.add_trace(
+            go.Scatter(
+                x=ev["dt"],
+                y=ev["price"],
+                mode="markers",
+                marker=dict(size=12, symbol=sym),
+                name="Markers",
+                text=text,
+                hovertemplate="%{text}<br>$%{y:,.2f}<br>%{x}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(height=520, xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("⏳ Waiting for stronger conditions")
+    st.info("No candle data yet.")
 
-paper = state.get("paper", {}) or {}
-manual = state.get("manual", {}) or {}
-
-p1, p2, p3, p4 = st.columns(4)
-p1.metric("📄 Paper P/L (total)", f"${paper.get('total_pl_usd', 0):,.2f}")
-p2.metric("📄 Paper Position (BTC)", f"{paper.get('btc', 0):.6f}")
-p3.metric("🧾 Real P/L (total)", f"${manual.get('total_pl_usd', 0):,.2f}")
-p4.metric("🧾 Real Position (BTC)", f"{manual.get('btc', 0):.6f}")
-
-st.subheader("📊 BTC 1-Minute Candlesticks (Last 30 min) + Momentum Arrows")
-render_candles_with_momentum(state.get("candles", []))
-
-st.subheader("🧾 Trades")
-t1, t2 = st.columns(2)
-with t1:
-    st.write("📄 Paper trades (latest)")
-    st.dataframe(paper.get("trades", [])[-20:], use_container_width=True, height=240)
-with t2:
-    st.write("🧾 Real (logged) trades (latest)")
-    st.dataframe(manual.get("trades", [])[-20:], use_container_width=True, height=240)
-
-st.markdown(
-    """
-**Telegram commands (manual logging):**
-- `/status` — shows current price/RSI/trend + P/L  
-- `/logbuy 100` — logs a real buy of **$100** at current price  
-- `/logsell 100` — logs a real sell of **$100** at current price  
-
-*(This dashboard is paper/record-keeping. It does not place real trades.)*
+with st.expander("How to use (important)", expanded=False):
+    st.write(
+        """
+This bot flags **setups** (not guaranteed wins).
+- Telegram: `/status`
+- Log real trades: `/logbuy 100` or `/logsell 100` (optional `[price]`)
+- It will also alert “Dip Watch” / “Peak Watch” for strong moves over ~3 hours.
 """
-)
+    )
+
+st.button("🔄 Refresh page")
