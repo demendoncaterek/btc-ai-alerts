@@ -11,170 +11,135 @@ REFRESH_MS = int(os.getenv("REFRESH_MS", "15000"))
 
 st.set_page_config(page_title="BTC AI Dashboard", layout="wide")
 
-# ================= NAV =================
-page = st.query_params.get("page", "overview")
+# ---------- Helpers ----------
+def safe_get(d, key, default=None):
+    return d[key] if isinstance(d, dict) and key in d else default
 
-nav1, nav2 = st.columns(2)
-with nav1:
-    if st.button("🏠 Overview"):
-        st.query_params.clear()
-        st.rerun()
-
-with nav2:
-    if st.button("📒 Trades"):
-        st.query_params["page"] = "trades"
-        st.rerun()
-
-st.divider()
-
-# ================= FETCH =================
 def fetch_state():
     try:
         r = requests.get(f"{ENGINE_URL}/state", timeout=6)
-        return r.json()
+        data = r.json()
+        data["ok"] = True
+        return data
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-def fetch_health():
-    try:
-        r = requests.get(f"{ENGINE_URL}/health", timeout=6)
-        return r.json()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+# ---------- Header ----------
+st.title("🧠 BTC AI Dashboard")
+st.caption("15m execution • 1h+4h bias • ATR SL/TP • Telegram alerts")
 
+# ---------- Fetch ----------
 state = fetch_state()
 
-# ================= ENGINE NOT READY =================
 if not state.get("ok"):
-    st.title("🧠 BTC AI Dashboard")
     st.warning("⏳ Engine not ready yet.")
-
     with st.expander("Debug", expanded=True):
         st.write("ENGINE_URL:", ENGINE_URL)
-        st.json(state)
-
+        st.error(state.get("error", "Unknown error"))
         if st.button("Ping /health"):
-            st.json(fetch_health())
-
+            try:
+                st.json(requests.get(f"{ENGINE_URL}/health", timeout=5).json())
+            except Exception as e:
+                st.error(str(e))
     st.stop()
 
-# ================= CANDLE NORMALIZER =================
-def normalize_candles(raw):
-    """
-    Supports:
-    - Dict candles: {time, open, high, low, close}
-    - List candles: [time, low, high, open, close, volume]
-    """
-    if not raw:
-        return pd.DataFrame()
+# ---------- Top Metrics ----------
+c1, c2, c3, c4 = st.columns(4)
 
-    first = raw[0]
+c1.metric("BTC Price", f"${safe_get(state,'price',0):,.2f}")
+c2.metric("RSI (5m)", safe_get(state, "rsi", "--"))
+c3.metric("Signal", safe_get(state, "signal", "WAIT"))
+c4.metric("Confidence", f"{safe_get(state,'confidence',0)}%")
 
-    # Dict format
-    if isinstance(first, dict):
-        df = pd.DataFrame(raw)
-        df.rename(columns={"t": "time", "timestamp": "time"}, inplace=True)
-        return df
+# ---------- Status Banner ----------
+confidence = safe_get(state, "confidence", 0)
+if confidence >= 75:
+    st.success("🔥 High-probability setup")
+elif confidence >= 60:
+    st.warning("⚠️ Medium-confidence setup")
+else:
+    st.info("⏳ Waiting for high-probability setup")
 
-    # List format (Coinbase style)
-    if isinstance(first, (list, tuple)) and len(first) >= 5:
-        df = pd.DataFrame(
-            raw,
-            columns=["time", "low", "high", "open", "close", "volume"][: len(first)]
+# ---------- Candlestick Chart ----------
+st.subheader("📊 BTC Candlesticks")
+
+candles = safe_get(state, "candles", [])
+
+if not candles:
+    st.info("No candle data yet.")
+else:
+    df = pd.DataFrame(candles)
+
+    required_cols = {"time", "open", "high", "low", "close"}
+    if not required_cols.issubset(df.columns):
+        st.warning("Candle data incomplete — waiting for full feed.")
+    else:
+        fig = go.Figure(
+            data=[
+                go.Candlestick(
+                    x=df["time"],
+                    open=df["open"],
+                    high=df["high"],
+                    low=df["low"],
+                    close=df["close"],
+                    name="BTC"
+                )
+            ]
         )
-        return df
 
-    return pd.DataFrame()
+        # Momentum markers (optional)
+        if "bullish" in df.columns:
+            fig.add_scatter(
+                x=df[df["bullish"]]["time"],
+                y=df[df["bullish"]]["low"],
+                mode="markers",
+                marker=dict(color="lime", size=8, symbol="triangle-up"),
+                name="Bullish momentum"
+            )
 
-# ================= OVERVIEW =================
-if page == "overview":
-    st.title("🧠 BTC AI Dashboard")
-    st.caption("15m execution • 1h + 4h bias • ATR SL/TP • Telegram alerts")
+        if "bearish" in df.columns:
+            fig.add_scatter(
+                x=df[df["bearish"]]["time"],
+                y=df[df["bearish"]]["high"],
+                mode="markers",
+                marker=dict(color="red", size=8, symbol="triangle-down"),
+                name="Bearish momentum"
+            )
 
-    cols = st.columns(4)
-    cols[0].metric("BTC Price", f"${state['price']:,.2f}")
-    cols[1].metric("RSI (5m)", state.get("rsi_5m", "--"))
-    cols[2].metric("Signal", state["signal"])
-    cols[3].metric("Confidence", f"{state['confidence']}%")
+        fig.update_layout(
+            template="plotly_dark",
+            height=420,
+            xaxis_rangeslider_visible=False,
+            margin=dict(l=20, r=20, t=30, b=20),
+        )
 
-    if state["signal"] == "WAIT":
-        st.warning("⏳ Waiting for high-probability setup")
-    elif state["signal"] == "BUY":
-        st.success("🟢 BUY setup detected")
-    elif state["signal"] == "SELL":
-        st.error("🔴 SELL setup detected")
+        st.plotly_chart(fig, use_container_width=True)
 
-    # ================= CHART =================
-    st.subheader("📊 BTC Candlesticks")
+# ---------- Trade Journal ----------
+st.divider()
+st.header("📓 Trade Journal")
 
-    candles = normalize_candles(state.get("candles", []))
+paper_equity = safe_get(state, "paper_equity", 0.0)
+real_equity = safe_get(state, "real_equity", 0.0)
 
-    if candles.empty:
-        st.info("No candle data yet.")
-        st.stop()
+t1, t2 = st.columns(2)
+t1.metric("Paper Equity", f"${paper_equity:,.2f}")
+t2.metric("Real Equity (Logged)", f"${real_equity:,.2f}")
 
-    # Safe time column
-    if "time" not in candles.columns:
-        candles["time"] = range(len(candles))
+paper_trades = safe_get(state, "paper_trades", [])
+real_trades = safe_get(state, "real_trades", [])
 
-    fig = go.Figure()
+st.subheader("🧪 Paper Trades")
+if paper_trades:
+    st.dataframe(pd.DataFrame(paper_trades))
+else:
+    st.info("No paper trades yet.")
 
-    fig.add_trace(go.Candlestick(
-        x=candles["time"],
-        open=candles["open"],
-        high=candles["high"],
-        low=candles["low"],
-        close=candles["close"],
-        name="BTC"
-    ))
+st.subheader("💰 Real Trades")
+if real_trades:
+    st.dataframe(pd.DataFrame(real_trades))
+else:
+    st.info("No real trades logged yet.")
 
-    # Momentum arrows
-    for b in state.get("bullish_marks", []):
-        fig.add_trace(go.Scatter(
-            x=[b["x"]],
-            y=[b["y"]],
-            mode="markers",
-            marker=dict(color="green", symbol="triangle-up", size=10),
-            name="Bullish"
-        ))
-
-    for b in state.get("bearish_marks", []):
-        fig.add_trace(go.Scatter(
-            x=[b["x"]],
-            y=[b["y"]],
-            mode="markers",
-            marker=dict(color="red", symbol="triangle-down", size=10),
-            name="Bearish"
-        ))
-
-    fig.update_layout(
-        height=520,
-        xaxis_rangeslider_visible=False,
-        template="plotly_dark"
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-# ================= TRADES =================
-elif page == "trades":
-    st.title("📒 Trade Journal")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("🧪 Paper Trades")
-        df = pd.DataFrame(state.get("paper_trades", []))
-        st.dataframe(df if not df.empty else pd.DataFrame(), use_container_width=True)
-
-    with col2:
-        st.subheader("💰 Real Trades")
-        df = pd.DataFrame(state.get("real_trades", []))
-        st.dataframe(df if not df.empty else pd.DataFrame(), use_container_width=True)
-
-    st.divider()
-
-    cols = st.columns(4)
-    cols[0].metric("Paper Equity", f"${state['paper_equity']:,.2f}")
-    cols[1].metric("Paper P/L", f"${state['paper_pl']:,.2f}")
-    cols[2].metric("Real BTC", f"{state['real_btc']:.6f}")
-    cols[3].metric("Unrealized P/L", f"${state['real_unrealized_pl']:,.2f}")
+# ---------- Footer ----------
+st.caption(f"Last update: {safe_get(state,'time','--')} • Source: {safe_get(state,'src','')}")
