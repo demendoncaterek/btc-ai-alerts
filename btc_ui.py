@@ -1,5 +1,21 @@
+"""
+btc_ui.py
+Streamlit UI for btc_engine.py
+
+Overview:
+- Price / RSI / Signal / Confidence
+- Bias (1h + 6h), ATR SL/TP, Peak/Dip watch
+- Candles + momentum arrows
+Trades:
+- Paper equity + trade tables
+- Real trades table + manual log form
+Connection Debug:
+- Ping /health and /state
+"""
+
 import os
-import time
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
 import plotly.graph_objects as go
 import requests
@@ -10,230 +26,247 @@ try:
 except Exception:
     st_autorefresh = None
 
+
 ENGINE_URL = os.getenv("ENGINE_URL", "http://localhost:8080").rstrip("/")
 REFRESH_MS = int(os.getenv("REFRESH_MS", "10000"))  # 10s
+REQ_TIMEOUT = float(os.getenv("REQ_TIMEOUT", "6"))
 
 st.set_page_config(page_title="BTC AI Dashboard", layout="wide")
-st.title("🧠 BTC AI Dashboard")
-st.caption("15m execution • 1h+4h bias • RSI(5m) • ATR SL/TP • Peak/Dip watch • Paper/Real logs")
 
-# ---------- query params helpers ----------
-def _get_qp():
-    try:
-        return dict(st.query_params)
-    except Exception:
-        return st.experimental_get_query_params()
+page = st.query_params.get("page", "overview").lower()
+if page not in ("overview", "trades"):
+    page = "overview"
 
-def _set_qp(**kw):
-    try:
-        for k, v in kw.items():
-            st.query_params[k] = v
-    except Exception:
-        st.experimental_set_query_params(**kw)
 
-def _rerun():
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
-
-qp = _get_qp()
-page = qp.get("page", "overview")
-if isinstance(page, list):
-    page = page[0] if page else "overview"
-page = str(page).lower().strip() or "overview"
-
-# ---------- HTTP helpers ----------
-SESSION = requests.Session()
-
-def get_json(path: str, timeout=(2, 5)):
-    """
-    timeout=(connect, read) so we don't hang forever
-    """
-    url = f"{ENGINE_URL}{path}"
-    r = SESSION.get(url, timeout=timeout)
+def get_json(path: str) -> Dict[str, Any]:
+    r = requests.get(f"{ENGINE_URL}{path}", timeout=REQ_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-def parse_candles(raw):
-    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
-        df = pd.DataFrame(raw)
-        if "time" in df.columns:
-            df["time"] = pd.to_datetime(df["time"], errors="coerce")
-        for c in ["open", "high", "low", "close", "volume"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        need = {"time", "open", "high", "low", "close"}
-        if not need.issubset(df.columns):
-            return pd.DataFrame()
-        return df.dropna(subset=["time", "open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
+
+def post_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.post(f"{ENGINE_URL}{path}", json=payload, timeout=REQ_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def try_fetch_state() -> Dict[str, Any]:
+    try:
+        return get_json("/state")
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def connection_debug_box(err: Optional[str] = None) -> None:
+    with st.expander("Connection Debug", expanded=True):
+        st.write("ENGINE_URL:", ENGINE_URL)
+        c1, c2 = st.columns(2)
+        if c1.button("Ping /health"):
+            try:
+                st.json(get_json("/health"))
+            except Exception as e:
+                st.error(str(e))
+        if c2.button("Ping /state"):
+            try:
+                st.json(get_json("/state"))
+            except Exception as e:
+                st.error(str(e))
+
+        if err:
+            st.error(err)
+            st.markdown(
+                """
+**Fix checklist (Railway):**
+1) Open your engine’s public URL in a browser and go to `/health`. It must return JSON.  
+2) If it doesn't, your engine service is not running or start command is wrong.  
+3) If public works but internal fails, set UI `ENGINE_URL` to the public engine URL temporarily.
+                """
+            )
+
+
+def normalize_candles(candles: Any) -> pd.DataFrame:
+    if not isinstance(candles, list) or len(candles) == 0:
+        return pd.DataFrame()
+    if isinstance(candles[0], dict):
+        df = pd.DataFrame(candles)
+        for col in ["iso", "open", "high", "low", "close"]:
+            if col not in df.columns:
+                return pd.DataFrame()
+        df["iso"] = pd.to_datetime(df["iso"], errors="coerce")
+        df = df.dropna(subset=["iso", "open", "high", "low", "close"])
+        return df
     return pd.DataFrame()
 
-def fmt_money(x):
-    try:
-        return f"${float(x):,.2f}"
-    except Exception:
-        return "—"
 
-def fmt_num(x, d=2):
-    try:
-        return f"{float(x):.{d}f}"
-    except Exception:
-        return "—"
-
-def fmt_pct(x, d=2):
-    try:
-        return f"{float(x) * 100:.{d}f}%"
-    except Exception:
-        return "—"
-
-# ---------- nav buttons ----------
-l, r = st.columns([1, 1])
-with l:
-    if st.button("🏠 Overview", use_container_width=True, disabled=(page == "overview")):
-        _set_qp(page="overview"); _rerun()
-with r:
-    if st.button("📒 Trades", use_container_width=True, disabled=(page == "trades")):
-        _set_qp(page="trades"); _rerun()
-
-# ---------- always-visible debug header ----------
-with st.expander("Connection Debug", expanded=True):
-    st.write("ENGINE_URL:", ENGINE_URL)
-
-    colA, colB = st.columns([1, 1])
-    with colA:
-        if st.button("Ping /health", use_container_width=True):
-            try:
-                t0 = time.time()
-                h = get_json("/health", timeout=(2, 4))
-                dt = (time.time() - t0) * 1000
-                st.success(f"/health OK in {dt:.0f} ms")
-                st.json(h)
-            except Exception as e:
-                st.error(f"/health failed: {e}")
-
-    with colB:
-        if st.button("Ping /state", use_container_width=True):
-            try:
-                t0 = time.time()
-                s = get_json("/state", timeout=(2, 5))
-                dt = (time.time() - t0) * 1000
-                st.success(f"/state OK in {dt:.0f} ms")
-                st.json({k: s.get(k) for k in ["ok","ts","price","signal","confidence","reason"]})
-            except Exception as e:
-                st.error(f"/state failed: {e}")
-
-# ---------- try connecting BEFORE autorefresh ----------
-status_box = st.empty()
-status_box.info("Connecting to engine…")
-
-try:
-    health = get_json("/health", timeout=(2, 4))
-except Exception as e:
-    status_box.error(
-        "Engine is NOT reachable from the UI right now.\n\n"
-        f"Error: {e}\n\n"
-        "Fix:\n"
-        "1) In UI Railway Variables, set ENGINE_URL to: http://btc-engine.railway.internal:8080\n"
-        "2) Make sure your ENGINE service is running and listening on port 8080.\n"
-        "3) If your service name isn’t literally btc-engine, replace it in the URL.\n"
+def plot_candles(df: pd.DataFrame, markers: List[Dict[str, Any]]) -> go.Figure:
+    fig = go.Figure(
+        data=[
+            go.Candlestick(
+                x=df["iso"],
+                open=df["open"],
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                name="BTC",
+            )
+        ]
     )
+
+    if markers:
+        bulls_x, bulls_y, bears_x, bears_y = [], [], [], []
+        for m in markers:
+            t = m.get("t")
+            p = m.get("price")
+            if t is None or p is None:
+                continue
+            if m.get("type") == "bull":
+                bulls_x.append(t); bulls_y.append(p)
+            elif m.get("type") == "bear":
+                bears_x.append(t); bears_y.append(p)
+
+        if bulls_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=pd.to_datetime(bulls_x),
+                    y=bulls_y,
+                    mode="markers",
+                    name="Bullish momentum",
+                    marker=dict(symbol="arrow-up", size=10),
+                )
+            )
+        if bears_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=pd.to_datetime(bears_x),
+                    y=bears_y,
+                    mode="markers",
+                    name="Bearish momentum",
+                    marker=dict(symbol="arrow-down", size=10),
+                )
+            )
+
+    fig.update_layout(height=520, margin=dict(l=10, r=10, t=10, b=10), xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
+    return fig
+
+
+if st_autorefresh:
+    st_autorefresh(interval=REFRESH_MS, key="btc_autorefresh")
+
+
+st.title("🧠 BTC AI Dashboard")
+st.caption("15m execution • 1h + 6h bias • RSI/MACD • ATR SL/TP • Peak/Dip watch • Paper/Real logs")
+
+nav1, nav2 = st.columns(2)
+if nav1.button("🏠 Overview", use_container_width=True):
+    st.query_params["page"] = "overview"
+    st.rerun()
+if nav2.button("🗒️ Trades", use_container_width=True):
+    st.query_params["page"] = "trades"
+    st.rerun()
+
+if st.button("🔄 Refresh now"):
+    st.rerun()
+
+state = try_fetch_state()
+if not state.get("ok"):
+    connection_debug_box(state.get("error", "Engine not reachable"))
     st.stop()
 
-status_box.success("Engine reachable ✅")
+price = float(state.get("price", 0.0) or 0.0)
+signal = state.get("signal", "WAIT")
+confidence = float(state.get("confidence", 0.0) or 0.0)
+bias1h = state.get("bias_1h", "—")
+bias6h = state.get("bias_6h", "—")
+rsi_val = state.get("rsi", None)
+atr_val = state.get("atr", None)
+sl = state.get("sl", None)
+tp = state.get("tp", None)
+peak_watch = state.get("peak_watch", None)
+iso = state.get("iso", "")
 
-# only start autorefresh AFTER engine is reachable
-if st_autorefresh:
-    st_autorefresh(interval=REFRESH_MS, key="auto")
+if page == "overview":
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("BTC Price", f"${price:,.2f}")
+    c2.metric("RSI (base)", "--" if rsi_val is None else f"{float(rsi_val):.1f}")
+    c3.metric("Signal", signal)
+    c4.metric("Confidence", f"{confidence:.0f}%")
+
+    st.info("⏳ Waiting for high-probability setup" if signal == "WAIT" else f"📌 Setup detected: **{signal}**")
+    st.caption(f"Last update: {iso} • Source: Coinbase Exchange • Bias: 1h={bias1h}, 6h={bias6h}")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        st.subheader("Peak/Dip watch")
+        if isinstance(peak_watch, dict):
+            st.json(peak_watch)
+        else:
+            st.write("No active peak/dip watch.")
+    with b2:
+        st.subheader("Risk levels (ATR)")
+        if atr_val is None:
+            st.write("ATR not ready yet.")
+        else:
+            st.write(f"ATR: {float(atr_val):.2f}")
+            if sl is not None and tp is not None:
+                st.write(f"SL: {float(sl):,.2f}")
+                st.write(f"TP: {float(tp):,.2f}")
+            else:
+                st.write("No SL/TP because signal is WAIT.")
+
+    st.subheader("📊 BTC Candlesticks")
+    df = normalize_candles(state.get("candles"))
+    if df.empty:
+        st.warning("Candle data incomplete — waiting for full feed.")
+    else:
+        st.plotly_chart(plot_candles(df, state.get("markers", []) or []), use_container_width=True)
+
+    with st.expander("Why is it saying this? (/explain)"):
+        try:
+            st.json(get_json("/explain"))
+        except Exception as e:
+            st.error(str(e))
+
 else:
-    st.warning("Auto-refresh disabled: install streamlit-autorefresh if you want 10s refresh.")
+    st.header("🗒️ Trade Journal")
 
-# ---------- pages ----------
-if page == "trades":
-    st.subheader("📒 Trade Journal")
     try:
-        state = get_json("/state", timeout=(2, 6))
-        t = get_json("/trades", timeout=(2, 8))
+        trades = get_json("/trades")
     except Exception as e:
-        st.error(str(e))
+        connection_debug_box(str(e))
         st.stop()
 
-    paper = t.get("paper", {}) if isinstance(t.get("paper"), dict) else {}
+    paper = trades.get("paper", {}) or {}
     c1, c2, c3 = st.columns(3)
-    c1.metric("Paper USD", fmt_money(paper.get("usd", 0.0)))
-    c2.metric("Paper BTC", fmt_num(paper.get("btc", 0.0), 8))
-    c3.metric("Paper Equity", fmt_money(paper.get("equity", 0.0)))
+    c1.metric("Paper USD", f"${float(paper.get('usd', 0.0)):,.2f}")
+    c2.metric("Paper BTC", f"{float(paper.get('btc', 0.0)):.6f}")
+    c3.metric("Paper Equity", f"${float(paper.get('equity', 0.0)):,.2f}", f"P/L ${float(paper.get('pnl', 0.0)):,.2f}")
 
-    st.markdown("### 🧪 Paper Trades")
-    pt = t.get("paper_trades", [])
-    st.dataframe(pd.DataFrame(pt) if pt else pd.DataFrame(), use_container_width=True, hide_index=True)
+    st.subheader("🧪 Paper Trades")
+    paper_rows = trades.get("paper_trades", []) or []
+    if paper_rows:
+        st.dataframe(pd.DataFrame(paper_rows), use_container_width=True)
+    else:
+        st.info("No paper trades yet.")
 
-    st.markdown("### 💰 Real Trades (Logged)")
-    rt = t.get("real_trades", [])
-    st.dataframe(pd.DataFrame(rt) if rt else pd.DataFrame(), use_container_width=True, hide_index=True)
+    st.subheader("💰 Real Trades (Logged)")
+    real_rows = trades.get("real_trades", []) or []
+    if real_rows:
+        st.dataframe(pd.DataFrame(real_rows), use_container_width=True)
+    else:
+        st.info("No real trades logged yet.")
 
-    st.caption(f"Last update: {state.get('ts','—')} • Auto-refresh: {REFRESH_MS/1000:.0f}s")
-    if st.button("🔄 Refresh now"): _rerun()
-    st.stop()
-
-# overview
-try:
-    s = get_json("/state", timeout=(2, 6))
-except Exception as e:
-    st.error(f"Failed to load /state: {e}")
-    st.stop()
-
-if not s.get("ok"):
-    st.warning("⏳ Engine reachable, but not ready yet.")
-    st.write("Reason:", s.get("reason", "—"))
-    st.stop()
-
-price = s.get("price")
-signal = s.get("signal", "WAIT")
-conf = s.get("confidence", 0.0)
-bias = s.get("trend_bias", "—")
-rsi = s.get("rsi_5m")
-mom = s.get("momentum")
-peak = s.get("peak_watch", False)
-dip = s.get("dip_watch", False)
-
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("BTC Price", fmt_money(price))
-c2.metric("RSI (5m)", "—" if rsi is None else fmt_num(rsi, 1))
-c3.metric("Signal", str(signal))
-c4.metric("Confidence", f"{fmt_num(conf, 0)}%")
-c5.metric("Bias (1h+4h)", str(bias))
-c6.metric("Momentum (ROC)", "—" if mom is None else fmt_pct(mom, 2))
-
-if signal in ("BUY", "SELL"):
-    st.success(f"✅ {signal} setup detected")
-elif peak or dip:
-    st.info("👀 Watch: possible swing point (peak/dip watch).")
-else:
-    st.info("⏳ Waiting for a high-probability setup")
-
-with st.expander("Why?", expanded=False):
-    try:
-        st.json(get_json("/explain", timeout=(2, 6)))
-    except Exception as e:
-        st.error(str(e))
-
-st.subheader("📊 BTC Candlesticks (15m)")
-df = parse_candles(s.get("candles_15m", []))
-if df.empty or len(df) < 20:
-    st.warning("Candle data incomplete — waiting for full feed.")
-else:
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="BTC"
-    ))
-    fig.update_layout(height=540, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-paper = s.get("paper", {}) if isinstance(s.get("paper"), dict) else {}
-p1, p2 = st.columns(2)
-p1.metric("Paper Equity", fmt_money(paper.get("equity", 0.0)))
-p2.metric("Paper P/L", fmt_money(paper.get("pl", 0.0)))
-
-st.caption(f"Last update: {s.get('ts','—')} • Source: {s.get('src','—')} • Auto-refresh: {REFRESH_MS/1000:.0f}s")
-if st.button("🔄 Refresh now"): _rerun()
+    st.subheader("Log a real trade (manual)")
+    with st.form("log_real"):
+        side = st.selectbox("Side", ["BUY", "SELL"])
+        qty = st.number_input("Qty (BTC)", min_value=0.0, value=0.0, step=0.0001, format="%.6f")
+        note = st.text_input("Note (optional)")
+        if st.form_submit_button("Log trade"):
+            try:
+                out = post_json("/real/log", {"side": side, "qty": qty, "note": note})
+                if out.get("ok"):
+                    st.success("Logged.")
+                    st.rerun()
+                else:
+                    st.error(out)
+            except Exception as e:
+                st.error(str(e))
