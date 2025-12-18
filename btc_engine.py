@@ -1,552 +1,32 @@
-import os, json, time, threading
-from datetime import datetime, timedelta, timezone
+import os
+import time
+import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+import pandas as pd
 import requests
-from fastapi import FastAPI, Body
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-APP_VERSION = "2025-12-17"
+VERSION = "2025-12-17"
 
-# =========================
-# Config (env vars)
-# =========================
-PRODUCT_ID = os.getenv("COINBASE_PRODUCT", "BTC-USD")
-
-REFRESH_SEC = float(os.getenv("REFRESH_SEC", "10"))  # engine loop period
-
-# Coinbase Exchange supports: 60, 300, 900, 3600, 21600, 86400
-EXEC_GRAN_SEC = int(os.getenv("EXEC_GRAN_SEC", "900"))        # 15m execution
-BIAS_1H_GRAN_SEC = int(os.getenv("BIAS_1H_GRAN_SEC", "3600"))  # 1h bias
-BIAS_6H_GRAN_SEC = int(os.getenv("BIAS_6H_GRAN_SEC", "21600")) # 6h bias
-RSI_5M_GRAN_SEC = int(os.getenv("RSI_5M_GRAN_SEC", "300"))     # 5m RSI confirm
-
-CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", "200"))
-
+PRODUCT = os.getenv("PRODUCT", "BTC-USD")
+EXCHANGE_BASE = os.getenv("EXCHANGE_BASE", "https://api.exchange.coinbase.com").rstrip("/")
+REFRESH_SEC = int(os.getenv("REFRESH_SEC", "10"))  # background refresh cadence
 PEAK_WINDOW_MIN = int(os.getenv("PEAK_WINDOW_MIN", "180"))
-PEAK_NEAR_PCT = float(os.getenv("PEAK_NEAR_PCT", "0.25"))
+NEAR_PEAK_PCT = float(os.getenv("NEAR_PEAK_PCT", "0.003"))  # 0.3%
+NEAR_DIP_PCT = float(os.getenv("NEAR_DIP_PCT", "0.003"))
 
-# Paper sim (educational)
+AUTO_PAPER = os.getenv("AUTO_PAPER", "false").lower() in ("1", "true", "yes", "y")
 PAPER_START_USD = float(os.getenv("PAPER_START_USD", "250"))
-PAPER_MIN_CONF = float(os.getenv("PAPER_MIN_CONF", "65"))
+PAPER_RISK_PCT = float(os.getenv("PAPER_RISK_PCT", "0.01"))  # risk 1% of equity per trade (paper)
 
-# Confidence calibration (educational)
-CAL_ENABLED = os.getenv("CAL_ENABLED", "1") == "1"
-CAL_HORIZON_BARS = int(os.getenv("CAL_HORIZON_BARS", "4"))  # 4x15m = 1 hour
-CAL_MAX_EVENTS = int(os.getenv("CAL_MAX_EVENTS", "2000"))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # if set, only respond to this chat id
 
-DATA_DIR = os.getenv("DATA_DIR", "/tmp")
-PERSIST = os.getenv("PERSIST", "1") == "1"
-
-# Telegram (optional)
-ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "1") == "1"
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-COINBASE_EXCHANGE_BASE = os.getenv("COINBASE_EXCHANGE_BASE", "https://api.exchange.coinbase.com")
-
-# =========================
-# Indicators
-# =========================
-def ema(values: List[float], period: int) -> List[float]:
-    if not values:
-        return []
-    k = 2 / (period + 1)
-    out = [values[0]]
-    for v in values[1:]:
-        out.append(out[-1] + k * (v - out[-1]))
-    return out
-
-def rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    gains, losses = 0.0, 0.0
-    for i in range(-period, 0):
-        diff = closes[i] - closes[i - 1]
-        if diff >= 0:
-            gains += diff
-        else:
-            losses -= diff
-    if losses == 0:
-        return 100.0
-    rs = gains / losses
-    return 100.0 - (100.0 / (1.0 + rs))
-
-def macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    if len(closes) < slow + signal:
-        return (None, None, None)
-    fast_ema = ema(closes, fast)
-    slow_ema = ema(closes, slow)
-    macd_line = [f - s for f, s in zip(fast_ema[-len(slow_ema):], slow_ema)]
-    signal_line = ema(macd_line, signal)
-    hist = macd_line[-1] - signal_line[-1]
-    return (macd_line[-1], signal_line[-1], hist)
-
-def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1 or len(highs) < period + 1 or len(lows) < period + 1:
-        return None
-    trs: List[float] = []
-    for i in range(-period, 0):
-        hi, lo = highs[i], lows[i]
-        prev_close = closes[i - 1]
-        tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
-        trs.append(tr)
-    return sum(trs) / len(trs)
-
-# =========================
-# Candles fetch
-# =========================
-def _iso(dt: datetime) -> str:
-    return dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-
-def fetch_candles(gran_sec: int, limit: int = CANDLES_LIMIT) -> List[Dict[str, Any]]:
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(seconds=gran_sec * limit)
-    url = f"{COINBASE_EXCHANGE_BASE}/products/{PRODUCT_ID}/candles"
-    params = {"start": _iso(start), "end": _iso(end), "granularity": str(gran_sec)}
-    headers = {"User-Agent": "btc-ai-dashboard/1.0"}
-    r = requests.get(url, params=params, headers=headers, timeout=10)
-    if r.status_code != 200:
-        raise RuntimeError(f"Coinbase API {r.status_code}: {r.text[:200]}")
-    data = r.json()
-
-    out: List[Dict[str, Any]] = []
-    for row in data:
-        if not isinstance(row, list) or len(row) < 6:
-            continue
-        t, low, high, open_, close, vol = row[:6]
-        dt = datetime.fromtimestamp(int(t), tz=timezone.utc)
-        out.append(
-            {"time": dt.isoformat(), "open": float(open_), "high": float(high), "low": float(low), "close": float(close), "volume": float(vol)}
-        )
-    out.sort(key=lambda x: x["time"])
-    return out
-
-# =========================
-# State + persistence
-# =========================
-_state_lock = threading.Lock()
-STATE: Dict[str, Any] = {
-    "ok": False,
-    "iso": None,
-    "product": PRODUCT_ID,
-    "price": None,
-    "signal": "WAIT",
-    "confidence": 0.0,
-    "trend": "UNKNOWN",
-    "bias_1h": "UNKNOWN",
-    "bias_6h": "UNKNOWN",
-    "rsi_5m": None,
-    "rsi_15m": None,
-    "macd_15m": None,
-    "macd_signal_15m": None,
-    "macd_hist_15m": None,
-    "atr_15m": None,
-    "sl": None,
-    "tp": None,
-    "peak_watch": False,
-    "dip_watch": False,
-    "peak_180m": None,
-    "dip_180m": None,
-    "reason": "",
-    "source": "Coinbase Exchange",
-    "version": APP_VERSION,
-}
-
-PAPER = {"usd": PAPER_START_USD, "btc": 0.0, "equity": PAPER_START_USD, "pos_entry": None, "pos_side": None, "realized_pnl": 0.0}
-paper_trades: List[Dict[str, Any]] = []
-real_trades: List[Dict[str, Any]] = []
-signal_events: List[Dict[str, Any]] = []  # calibration events
-
-def _persist_path(name: str) -> str:
-    return os.path.join(DATA_DIR, name)
-
-def load_persisted():
-    if not PERSIST:
-        return
-    for name, target in [("paper_trades.json", paper_trades), ("real_trades.json", real_trades), ("signal_events.json", signal_events), ("paper_state.json", None)]:
-        path = _persist_path(name)
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if name == "paper_state.json" and isinstance(data, dict):
-                PAPER.update(data)
-            elif isinstance(data, list):
-                target.clear()
-                target.extend(data)
-        except Exception:
-            pass
-
-def persist_all():
-    if not PERSIST:
-        return
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(_persist_path("paper_trades.json"), "w", encoding="utf-8") as f:
-            json.dump(paper_trades[-2000:], f)
-        with open(_persist_path("real_trades.json"), "w", encoding="utf-8") as f:
-            json.dump(real_trades[-2000:], f)
-        with open(_persist_path("signal_events.json"), "w", encoding="utf-8") as f:
-            json.dump(signal_events[-CAL_MAX_EVENTS:], f)
-        with open(_persist_path("paper_state.json"), "w", encoding="utf-8") as f:
-            json.dump(PAPER, f)
-    except Exception:
-        pass
-
-# =========================
-# Decision logic
-# =========================
-def compute_bias(candles: List[Dict[str, Any]], fast: int = 20, slow: int = 50) -> str:
-    closes = [c["close"] for c in candles]
-    if len(closes) < slow + 5:
-        return "UNKNOWN"
-    e_fast = ema(closes, fast)[-1]
-    e_slow = ema(closes, slow)[-1]
-    if e_fast > e_slow:
-        return "UP"
-    if e_fast < e_slow:
-        return "DOWN"
-    return "FLAT"
-
-def near_pct(a: float, b: float) -> float:
-    if b == 0:
-        return 999.0
-    return abs(a - b) / b * 100.0
-
-def decide(exec_c: List[Dict[str, Any]], bias1: str, bias6: str, rsi5: Optional[float]) -> Dict[str, Any]:
-    closes = [c["close"] for c in exec_c]
-    highs = [c["high"] for c in exec_c]
-    lows = [c["low"] for c in exec_c]
-    price = closes[-1] if closes else None
-
-    rsi15 = rsi(closes, 14)
-    m_line, m_sig, m_hist = macd(closes)
-    a15 = atr(highs, lows, closes)
-
-    if bias1 == "UP" and bias6 == "UP":
-        trend = "UP"
-    elif bias1 == "DOWN" and bias6 == "DOWN":
-        trend = "DOWN"
-    elif bias1 == "UNKNOWN" or bias6 == "UNKNOWN":
-        trend = "UNKNOWN"
-    else:
-        trend = "MIXED"
-
-    reasons: List[str] = []
-    score = 0.0
-
-    if trend == "UP":
-        score += 30; reasons.append("Higher-timeframe bias bullish (1h & 6h).")
-    elif trend == "DOWN":
-        score += 30; reasons.append("Higher-timeframe bias bearish (1h & 6h).")
-    elif trend == "MIXED":
-        score += 10; reasons.append("Higher-timeframe bias mixed.")
-    else:
-        reasons.append("Higher-timeframe bias not ready.")
-
-    if rsi15 is not None:
-        if rsi15 <= 30:
-            score += 25; reasons.append(f"RSI(15m) oversold ({rsi15:.1f}).")
-        elif rsi15 >= 70:
-            score += 25; reasons.append(f"RSI(15m) overbought ({rsi15:.1f}).")
-        else:
-            score += 10; reasons.append(f"RSI(15m) neutral ({rsi15:.1f}).")
-    else:
-        reasons.append("RSI(15m) not enough data yet.")
-
-    if rsi5 is not None:
-        score += 10 if (rsi5 <= 30 or rsi5 >= 70) else 5
-        reasons.append(f"RSI(5m) {'extreme' if (rsi5 <= 30 or rsi5 >= 70) else 'normal'} ({rsi5:.1f}).")
-
-    if m_hist is not None:
-        score += 15
-        reasons.append("MACD histogram " + ("positive (bullish momentum)." if m_hist > 0 else "negative (bearish momentum)."))
-    else:
-        reasons.append("MACD not enough data yet.")
-
-    signal = "WAIT"
-    if price is not None and rsi15 is not None and m_hist is not None:
-        if trend == "UP" and rsi15 <= 35 and m_hist >= 0:
-            signal = "BUY"; reasons.append("Setup: uptrend + pullback + momentum recovering.")
-        elif trend == "DOWN" and rsi15 >= 65 and m_hist <= 0:
-            signal = "SELL"; reasons.append("Setup: downtrend + bounce + momentum fading.")
-        elif rsi15 <= 25 and m_hist >= 0:
-            signal = "BUY"; reasons.append("Setup: deep oversold + momentum turning.")
-        elif rsi15 >= 75 and m_hist <= 0:
-            signal = "SELL"; reasons.append("Setup: deep overbought + momentum turning.")
-        else:
-            reasons.append("No high-probability setup yet.")
-
-    confidence = max(0.0, min(99.0, score))
-
-    sl = tp = None
-    if price is not None and a15 is not None:
-        if signal == "BUY":
-            sl = price - a15
-            tp = price + 2 * a15
-        elif signal == "SELL":
-            sl = price + a15
-            tp = price - 2 * a15
-
-    return {
-        "price": price,
-        "trend": trend,
-        "bias_1h": bias1,
-        "bias_6h": bias6,
-        "rsi_5m": rsi5,
-        "rsi_15m": rsi15,
-        "macd_15m": m_line,
-        "macd_signal_15m": m_sig,
-        "macd_hist_15m": m_hist,
-        "atr_15m": a15,
-        "signal": signal,
-        "confidence": confidence,
-        "sl": sl,
-        "tp": tp,
-        "reason": " ".join(reasons),
-    }
-
-# =========================
-# Paper sim (educational)
-# =========================
-def update_paper(price: Optional[float], signal: str, confidence: float):
-    if price is None:
-        return
-    PAPER["equity"] = PAPER["usd"] + PAPER["btc"] * price
-    if confidence < PAPER_MIN_CONF:
-        return
-
-    if signal == "BUY" and PAPER["btc"] == 0.0 and PAPER["usd"] > 1.0:
-        usd_to_use = PAPER["usd"] * 0.95
-        btc = usd_to_use / price
-        PAPER["usd"] -= usd_to_use
-        PAPER["btc"] += btc
-        PAPER["pos_entry"] = price
-        PAPER["pos_side"] = "LONG"
-        paper_trades.append({"ts": datetime.now(timezone.utc).isoformat(), "side": "BUY", "price": price, "btc": btc, "usd": usd_to_use, "note": f"auto paper (conf {confidence:.0f}%)"})
-    elif signal == "SELL" and PAPER["btc"] > 0.0:
-        btc = PAPER["btc"]
-        usd_out = btc * price
-        PAPER["usd"] += usd_out
-        PAPER["btc"] = 0.0
-        entry = PAPER.get("pos_entry") or price
-        pnl = (price - entry) * btc
-        PAPER["realized_pnl"] += pnl
-        PAPER["pos_entry"] = None
-        PAPER["pos_side"] = None
-        paper_trades.append({"ts": datetime.now(timezone.utc).isoformat(), "side": "SELL", "price": price, "btc": btc, "usd": usd_out, "pnl": pnl, "note": f"auto paper (conf {confidence:.0f}%)"})
-
-# =========================
-# Calibration (educational)
-# =========================
-def _conf_bucket(conf: float) -> int:
-    c = int(max(0, min(99, conf)))
-    return c // 10
-
-def record_signal_event(now: datetime, signal: str, confidence: float, price: float):
-    if not CAL_ENABLED or signal not in ("BUY", "SELL"):
-        return
-    resolve_at = now + timedelta(seconds=EXEC_GRAN_SEC * CAL_HORIZON_BARS)
-    signal_events.append({"ts": now.isoformat(), "signal": signal, "confidence": float(confidence), "entry_price": float(price), "resolve_at_iso": resolve_at.isoformat(), "resolved": False})
-    if len(signal_events) > CAL_MAX_EVENTS:
-        del signal_events[: len(signal_events) - CAL_MAX_EVENTS]
-
-def resolve_events(now: datetime, current_price: Optional[float]):
-    if not CAL_ENABLED or current_price is None:
-        return
-    for ev in signal_events:
-        if ev.get("resolved"):
-            continue
-        ra = ev.get("resolve_at_iso")
-        if not ra:
-            continue
-        try:
-            resolve_at = datetime.fromisoformat(ra)
-        except Exception:
-            continue
-        if now < resolve_at:
-            continue
-        entry = float(ev.get("entry_price") or 0.0)
-        sig = ev.get("signal")
-        ret = (current_price - entry) / entry * 100.0 if entry else 0.0
-        win = (current_price > entry) if sig == "BUY" else (current_price < entry)
-        ev.update({"resolved": True, "exit_price": float(current_price), "ret_pct": float(ret), "win": bool(win), "resolved_at": now.isoformat()})
-
-def calibration_summary(current_conf: float) -> Dict[str, Any]:
-    if not CAL_ENABLED:
-        return {"enabled": False}
-    buckets = [{"bucket": i, "wins": 0, "total": 0} for i in range(10)]
-    for ev in signal_events:
-        if not ev.get("resolved"):
-            continue
-        b = _conf_bucket(float(ev.get("confidence") or 0.0))
-        buckets[b]["total"] += 1
-        if ev.get("win"):
-            buckets[b]["wins"] += 1
-    out = []
-    for b in buckets:
-        total = b["total"]; wins = b["wins"]
-        out.append({"range": f"{b['bucket']*10}-{b['bucket']*10+9}", "wins": wins, "total": total, "win_rate": (wins / total) if total else None})
-    cb = _conf_bucket(current_conf)
-    cur = out[cb]
-    return {"enabled": True, "horizon_bars": CAL_HORIZON_BARS, "bar_seconds": EXEC_GRAN_SEC, "buckets": out, "current_bucket": cur["range"], "current_bucket_win_rate": cur["win_rate"], "samples_total": sum(x["total"] for x in out)}
-
-# =========================
-# Peak/Dip watch
-# =========================
-def compute_peak_dip_watch(candles_5m: List[Dict[str, Any]], price: Optional[float]) -> Tuple[bool, bool, Optional[float], Optional[float]]:
-    if price is None or not candles_5m:
-        return (False, False, None, None)
-    window_bars = max(2, int((PEAK_WINDOW_MIN * 60) / RSI_5M_GRAN_SEC))
-    closes = [c["close"] for c in candles_5m][-window_bars:]
-    if not closes:
-        return (False, False, None, None)
-    hi = max(closes); lo = min(closes)
-    peak = near_pct(price, hi) <= PEAK_NEAR_PCT
-    dip = near_pct(price, lo) <= PEAK_NEAR_PCT
-    return peak, dip, hi, lo
-
-# =========================
-# Telegram (no extra deps)
-# =========================
-_last_update_id = 0
-
-def tg_send(text: str, chat_id: Optional[str] = None):
-    if not (TG_TOKEN and ENABLE_TELEGRAM):
-        return
-    cid = chat_id or TG_CHAT_ID
-    if not cid:
-        return
-    try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": cid, "text": text}, timeout=10)
-    except Exception:
-        pass
-
-def format_status() -> str:
-    with _state_lock:
-        s = dict(STATE)
-    price = s.get("price"); conf = s.get("confidence"); sig = s.get("signal")
-    r5 = s.get("rsi_5m"); r15 = s.get("rsi_15m")
-    trend = s.get("trend"); b1 = s.get("bias_1h"); b6 = s.get("bias_6h")
-    reason = s.get("reason", "")
-    lines = [
-        "🧠 BTC Bot Status",
-        f"Price: ${price:,.2f}" if isinstance(price, (int, float)) else "Price: —",
-        f"Signal: {sig} (conf {conf:.0f}%)" if isinstance(conf, (int, float)) else f"Signal: {sig}",
-        f"Trend: {trend} (1h:{b1}, 6h:{b6})",
-        f"RSI(5m): {r5:.1f}" if isinstance(r5, (int, float)) else "RSI(5m): —",
-        f"RSI(15m): {r15:.1f}" if isinstance(r15, (int, float)) else "RSI(15m): —",
-    ]
-    if reason:
-        lines.append(f"Reason: {reason[:350]}")
-    return "\n".join(lines)
-
-def telegram_poll_loop():
-    global _last_update_id
-    while True:
-        if not (TG_TOKEN and ENABLE_TELEGRAM):
-            time.sleep(5); continue
-        try:
-            r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params={"timeout": 10, "offset": _last_update_id + 1}, timeout=20)
-            data = r.json()
-            if not data.get("ok"):
-                time.sleep(2); continue
-            for upd in data.get("result", []):
-                _last_update_id = max(_last_update_id, upd.get("update_id", 0))
-                msg = upd.get("message") or upd.get("edited_message")
-                if not msg:
-                    continue
-                chat_id = str(msg["chat"]["id"])
-                text = (msg.get("text") or "").strip()
-                if text.startswith("/start") or text.startswith("/help"):
-                    tg_send("Commands: /status, /health, /explain", chat_id)
-                elif text.startswith("/health"):
-                    with _state_lock:
-                        ok = bool(STATE.get("ok"))
-                    tg_send(f"✅ Engine ok: {ok}", chat_id)
-                elif text.startswith("/status"):
-                    tg_send(format_status(), chat_id)
-                elif text.startswith("/explain"):
-                    with _state_lock:
-                        reason = STATE.get("reason", "")
-                    tg_send(reason or "No reason yet.", chat_id)
-        except Exception:
-            pass
-        time.sleep(1)
-
-# =========================
-# Engine loop
-# =========================
-def engine_loop():
-    load_persisted()
-    prev_sig = "WAIT"
-    prev_peak = prev_dip = False
-
-    while True:
-        start_t = time.time()
-        try:
-            exec_c = fetch_candles(EXEC_GRAN_SEC, CANDLES_LIMIT)
-            bias1_c = fetch_candles(BIAS_1H_GRAN_SEC, max(120, CANDLES_LIMIT // 2))
-            bias6_c = fetch_candles(BIAS_6H_GRAN_SEC, max(120, CANDLES_LIMIT // 2))
-            rsi5_c = fetch_candles(RSI_5M_GRAN_SEC, max(220, CANDLES_LIMIT))
-
-            bias1 = compute_bias(bias1_c)
-            bias6 = compute_bias(bias6_c)
-            rsi5_val = rsi([c["close"] for c in rsi5_c], 14)
-
-            d = decide(exec_c, bias1, bias6, rsi5_val)
-            peak, dip, hi, lo = compute_peak_dip_watch(rsi5_c, d.get("price"))
-
-            now = datetime.now(timezone.utc)
-
-            resolve_events(now, d.get("price"))
-            if d.get("signal") != prev_sig and d.get("price") is not None:
-                record_signal_event(now, d.get("signal"), float(d.get("confidence") or 0), float(d.get("price")))
-
-            cal = calibration_summary(float(d.get("confidence") or 0.0))
-
-            with _state_lock:
-                STATE.update({
-                    "ok": True,
-                    "iso": now.isoformat(),
-                    **d,
-                    "peak_watch": peak,
-                    "dip_watch": dip,
-                    "peak_180m": hi,
-                    "dip_180m": lo,
-                    "candles_15m": exec_c[-200:],
-                    "calibration": cal,
-                })
-
-            update_paper(d.get("price"), d.get("signal", "WAIT"), float(d.get("confidence") or 0))
-            persist_all()
-
-            # optional alerts (signal + peak/dip)
-            if TG_TOKEN and ENABLE_TELEGRAM and TG_CHAT_ID:
-                if d.get("signal") != prev_sig:
-                    tg_send(f"🔔 Signal: {d.get('signal')} (conf {d.get('confidence'):.0f}%)\nPrice: ${d.get('price'):,.2f}\n{(d.get('reason') or '')[:300]}")
-                if peak and not prev_peak:
-                    tg_send(f"📈 Peak Watch • Price: ${d.get('price'):,.2f} • Near {PEAK_WINDOW_MIN}m high: {hi}")
-                if dip and not prev_dip:
-                    tg_send(f"📉 Dip Watch • Price: ${d.get('price'):,.2f} • Near {PEAK_WINDOW_MIN}m low: {lo}")
-
-            prev_sig = d.get("signal", prev_sig)
-            prev_peak, prev_dip = peak, dip
-
-        except Exception as e:
-            now = datetime.now(timezone.utc)
-            with _state_lock:
-                STATE.update({"ok": False, "iso": now.isoformat(), "error": str(e)})
-
-        elapsed = time.time() - start_t
-        time.sleep(max(0.5, REFRESH_SEC - elapsed))
-
-# =========================
-# FastAPI app
-# =========================
-app = FastAPI(title="BTC Engine", version=APP_VERSION)
+app = FastAPI(title="BTC Engine", version=VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -556,55 +36,472 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_state_lock = threading.Lock()
+_state: Dict[str, Any] = {"ok": False, "error": "starting"}
+_last_broadcast_sig: Optional[str] = None
+
+_paper = {
+    "usd": PAPER_START_USD,
+    "btc": 0.0,
+    "pos": None,  # {"side": "LONG"/"SHORT", "qty": float, "entry": float, "sl": float, "tp": float, "ts": iso}
+    "equity": PAPER_START_USD,
+    "unreal_pnl": 0.0,
+}
+_paper_trades: List[Dict[str, Any]] = []
+_real_trades: List[Dict[str, Any]] = []
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _tg_api(method: str, payload: dict, timeout: float = 10.0) -> Any:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    r = requests.post(url, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def _tg_send(chat_id: str, text: str) -> None:
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        _tg_api("sendMessage", {"chat_id": chat_id, "text": text}, timeout=8.0)
+    except Exception:
+        pass
+
+
+def _tg_allowed(chat_id: str) -> bool:
+    return (not TELEGRAM_CHAT_ID) or (str(chat_id) == str(TELEGRAM_CHAT_ID))
+
+
+def _tg_poll_loop() -> None:
+    # Poll Telegram so the bot can reply to: /health, /status, /trades
+    if not TELEGRAM_TOKEN:
+        return
+
+    offset = 0
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"timeout": 30, "offset": offset},
+                timeout=35,
+            ).json()
+
+            for upd in resp.get("result", []):
+                offset = max(offset, int(upd.get("update_id", 0)) + 1)
+                msg = upd.get("message") or upd.get("edited_message") or {}
+                text = (msg.get("text") or "").strip()
+                chat = msg.get("chat") or {}
+                chat_id = str(chat.get("id", ""))
+
+                if not (chat_id and text):
+                    continue
+                if not _tg_allowed(chat_id):
+                    continue
+
+                cmd = text.split()[0].lower()
+                if cmd == "/health":
+                    with _state_lock:
+                        ok = bool(_state.get("ok"))
+                        iso = _state.get("iso", _utc_iso())
+                        err = _state.get("error")
+                    _tg_send(chat_id, f"✅ Health\nengine_ok: {ok}\niso: {iso}\nerror: {err}")
+                elif cmd in ("/status", "/state"):
+                    with _state_lock:
+                        s = dict(_state)
+                    if not s.get("ok"):
+                        _tg_send(chat_id, f"⏳ Engine not ready.\nerror: {s.get('error')}\niso: {s.get('iso')}")
+                    else:
+                        _tg_send(
+                            chat_id,
+                            "📊 Status\n"
+                            f"Price: ${s.get('price', 0):,.2f}\n"
+                            f"Signal: {s.get('signal')} ({float(s.get('confidence', 0.0)):.0f}%)\n"
+                            f"Bias(1h/6h): {s.get('bias_1h')}/{s.get('bias_6h')}\n"
+                            f"RSI(5m/15m): {s.get('rsi_5m')} / {s.get('rsi_15m')}\n"
+                            f"SL/TP: {s.get('sl')} / {s.get('tp')}\n"
+                            f"iso: {s.get('iso')}",
+                        )
+                elif cmd == "/trades":
+                    last = _paper_trades[-5:]
+                    if not last:
+                        _tg_send(chat_id, "No paper trades yet.")
+                    else:
+                        lines = [
+                            f"{t.get('ts','')[-8:]} {t.get('type')} {t.get('side','')} @ {t.get('price','')}"
+                            for t in last
+                        ]
+                        _tg_send(chat_id, "🧪 Last paper trades:\n" + "\n".join(lines))
+                elif cmd in ("/start", "/help"):
+                    _tg_send(chat_id, "Commands: /health /status /trades")
+        except Exception:
+            pass
+
+        time.sleep(2)
+
+
+def _fetch_json(url: str, params: Optional[dict] = None, timeout: float = 8.0) -> Any:
+    r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": "btc-engine/1.0"})
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_spot_price() -> float:
+    data = _fetch_json(f"{EXCHANGE_BASE}/products/{PRODUCT}/ticker", timeout=6.0)
+    return float(data["price"])
+
+
+def fetch_candles(granularity_sec: int) -> pd.DataFrame:
+    raw = _fetch_json(
+        f"{EXCHANGE_BASE}/products/{PRODUCT}/candles",
+        params={"granularity": granularity_sec},
+        timeout=10.0,
+    )
+    df = pd.DataFrame(raw, columns=["time", "low", "high", "open", "close", "volume"])
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df.sort_values("time").reset_index(drop=True)
+    for c in ["low", "high", "open", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    return df
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    m = ema(series, fast) - ema(series, slow)
+    s = ema(m, signal)
+    h = m - s
+    return m, s, h
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def bias_from_ma(df: pd.DataFrame, span: int = 20) -> str:
+    if len(df) < span + 2:
+        return "UNKNOWN"
+    ma = ema(df["close"], span)
+    return "UP" if df["close"].iloc[-1] >= ma.iloc[-1] else "DOWN"
+
+
+def _paper_mark_to_market(price: float) -> None:
+    pos = _paper["pos"]
+    if pos is None:
+        _paper["equity"] = _paper["usd"] + _paper["btc"] * price
+        _paper["unreal_pnl"] = 0.0
+        return
+
+    qty = float(pos["qty"])
+    entry = float(pos["entry"])
+    unreal = (price - entry) * qty if pos["side"] == "LONG" else (entry - price) * qty
+    _paper["unreal_pnl"] = float(unreal)
+    _paper["equity"] = float(_paper["usd"] + unreal)
+
+
+def _paper_enter(side: str, price: float, atr_val: float, reason: str, confidence: float) -> None:
+    if _paper["pos"] is not None:
+        return
+
+    equity = float(_paper.get("equity", _paper["usd"]))
+    risk_dollars = max(1.0, equity * PAPER_RISK_PCT)
+    sl_mult = 1.2
+    tp_mult = 2.0
+    if atr_val <= 0 or np.isnan(atr_val):
+        atr_val = max(10.0, price * 0.001)
+
+    if side == "BUY":
+        sl = price - atr_val * sl_mult
+        tp = price + atr_val * tp_mult
+        per_unit_risk = max(1e-9, price - sl)
+        qty = risk_dollars / per_unit_risk
+        _paper["pos"] = {"side": "LONG", "qty": float(qty), "entry": float(price), "sl": float(sl), "tp": float(tp), "ts": _utc_iso()}
+    else:
+        sl = price + atr_val * sl_mult
+        tp = price - atr_val * tp_mult
+        per_unit_risk = max(1e-9, sl - price)
+        qty = risk_dollars / per_unit_risk
+        _paper["pos"] = {"side": "SHORT", "qty": float(qty), "entry": float(price), "sl": float(sl), "tp": float(tp), "ts": _utc_iso()}
+
+    _paper_trades.append(
+        {"ts": _utc_iso(), "type": "ENTRY", "side": side, "price": float(price), "qty": float(_paper["pos"]["qty"]),
+         "sl": float(_paper["pos"]["sl"]), "tp": float(_paper["pos"]["tp"]), "reason": reason, "confidence": float(confidence)}
+    )
+
+
+def _paper_check_exit(price: float) -> None:
+    pos = _paper["pos"]
+    if pos is None:
+        return
+    sl = float(pos["sl"])
+    tp = float(pos["tp"])
+    entry = float(pos["entry"])
+    qty = float(pos["qty"])
+
+    hit = None
+    pnl = 0.0
+    if pos["side"] == "LONG":
+        if price <= sl:
+            hit = "SL"
+        elif price >= tp:
+            hit = "TP"
+        if hit:
+            pnl = (price - entry) * qty
+    else:
+        if price >= sl:
+            hit = "SL"
+        elif price <= tp:
+            hit = "TP"
+        if hit:
+            pnl = (entry - price) * qty
+
+    if hit:
+        _paper["usd"] = float(_paper["usd"] + pnl)
+        _paper_trades.append({"ts": _utc_iso(), "type": "EXIT", "hit": hit, "price": float(price), "pnl": float(pnl), "equity": float(_paper["usd"])})
+        _paper["pos"] = None
+        _paper_mark_to_market(price)
+
+
+def compute_signal(
+    price: float,
+    rsi5: Optional[float],
+    macd_hist_15: Optional[float],
+    macd_hist_15_prev: Optional[float],
+    b1h: str,
+    b6h: str,
+    atr15: Optional[float],
+    near_peak: bool,
+    near_dip: bool,
+) -> Tuple[str, float, str]:
+    reasons = []
+    long_ok = (b1h == "UP" and b6h == "UP")
+    short_ok = (b1h == "DOWN" and b6h == "DOWN")
+
+    if b1h != "UNKNOWN":
+        reasons.append(f"1h bias {b1h.lower()}")
+    if b6h != "UNKNOWN":
+        reasons.append(f"6h bias {b6h.lower()}")
+
+    if rsi5 is not None:
+        if rsi5 <= 35:
+            reasons.append("RSI5 oversold")
+        if rsi5 >= 65:
+            reasons.append("RSI5 overbought")
+
+    macd_up = macd_hist_15 is not None and macd_hist_15_prev is not None and macd_hist_15 > macd_hist_15_prev
+    macd_down = macd_hist_15 is not None and macd_hist_15_prev is not None and macd_hist_15 < macd_hist_15_prev
+
+    if near_peak:
+        reasons.append("near rolling peak")
+    if near_dip:
+        reasons.append("near rolling dip")
+
+    signal = "WAIT"
+    if long_ok and (rsi5 is not None and rsi5 <= 35) and macd_up and not near_peak:
+        signal = "BUY"
+    elif short_ok and (rsi5 is not None and rsi5 >= 65) and macd_down and not near_dip:
+        signal = "SELL"
+
+    conf = 20.0 if signal == "WAIT" else 35.0
+    if signal == "BUY":
+        if rsi5 is not None and rsi5 <= 30:
+            conf += 10
+        if macd_up:
+            conf += 15
+        conf += (10 if b1h == "UP" else 0) + (10 if b6h == "UP" else 0)
+        conf += 5 if (atr15 is not None and not np.isnan(atr15)) else 0
+    elif signal == "SELL":
+        if rsi5 is not None and rsi5 >= 70:
+            conf += 10
+        if macd_down:
+            conf += 15
+        conf += (10 if b1h == "DOWN" else 0) + (10 if b6h == "DOWN" else 0)
+        conf += 5 if (atr15 is not None and not np.isnan(atr15)) else 0
+
+    conf = float(max(0.0, min(100.0, conf)))
+    return signal, conf, "; ".join(reasons[:6]) if reasons else "no setup"
+
+
+def _build_state() -> Dict[str, Any]:
+    t0 = time.time()
+
+    c5 = fetch_candles(300)
+    c15 = fetch_candles(900)
+    c1h = fetch_candles(3600)
+    c6h = fetch_candles(21600)
+
+    price = float(c5["close"].iloc[-1]) if len(c5) else fetch_spot_price()
+
+    rsi5_val = float(rsi(c5["close"]).iloc[-1]) if len(c5) >= 20 else None
+    rsi15_val = float(rsi(c15["close"]).iloc[-1]) if len(c15) >= 20 else None
+
+    _, _, h15 = macd(c15["close"]) if len(c15) >= 40 else (None, None, None)
+    macd_hist_15 = float(h15.iloc[-1]) if h15 is not None else None
+    macd_hist_15_prev = float(h15.iloc[-2]) if h15 is not None and len(h15) >= 2 else None
+
+    atr15_series = atr(c15) if len(c15) >= 20 else None
+    atr15_val = float(atr15_series.iloc[-1]) if atr15_series is not None else None
+
+    b1h = bias_from_ma(c1h)
+    b6h = bias_from_ma(c6h)
+
+    n = max(5, int(PEAK_WINDOW_MIN / 5))
+    peak = float(c5["high"].tail(n).max()) if len(c5) else price
+    dip = float(c5["low"].tail(n).min()) if len(c5) else price
+    near_peak = (peak - price) / peak <= NEAR_PEAK_PCT if peak > 0 else False
+    near_dip = (price - dip) / price <= NEAR_DIP_PCT if price > 0 else False
+
+    signal, conf, reason = compute_signal(price, rsi5_val, macd_hist_15, macd_hist_15_prev, b1h, b6h, atr15_val, near_peak, near_dip)
+
+    sl = tp = None
+    if atr15_val is not None and not np.isnan(atr15_val):
+        sl_mult = 1.2
+        tp_mult = 2.0
+        if signal == "BUY":
+            sl = price - atr15_val * sl_mult
+            tp = price + atr15_val * tp_mult
+        elif signal == "SELL":
+            sl = price + atr15_val * sl_mult
+            tp = price - atr15_val * tp_mult
+
+    _paper_mark_to_market(price)
+    _paper_check_exit(price)
+    if AUTO_PAPER and signal in ("BUY", "SELL"):
+        _paper_enter(signal, price, atr15_val or 0.0, reason=reason, confidence=conf)
+
+    events: List[Dict[str, Any]] = []
+    if near_peak:
+        events.append({"type": "PEAK_WATCH", "price": price, "near_peak": peak, "window_min": PEAK_WINDOW_MIN})
+    if near_dip:
+        events.append({"type": "DIP_WATCH", "price": price, "near_dip": dip, "window_min": PEAK_WINDOW_MIN})
+
+    def _serialize(df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
+        d = df.tail(limit).copy()
+        out = []
+        for _, row in d.iterrows():
+            out.append(
+                {"time": row["time"].isoformat(), "open": float(row["open"]), "high": float(row["high"]),
+                 "low": float(row["low"]), "close": float(row["close"]), "volume": float(row.get("volume", 0.0))}
+            )
+        return out
+
+    return {
+        "ok": True,
+        "version": VERSION,
+        "iso": _utc_iso(),
+        "latency_ms": int((time.time() - t0) * 1000),
+        "src": "Coinbase Exchange",
+        "product": PRODUCT,
+        "price": price,
+        "signal": signal,
+        "confidence": conf,
+        "reason": reason,
+        "bias_1h": b1h,
+        "bias_6h": b6h,
+        "rsi_5m": rsi5_val,
+        "rsi_15m": rsi15_val,
+        "macd_hist_15m": macd_hist_15,
+        "atr_15m": atr15_val,
+        "sl": sl,
+        "tp": tp,
+        "peak": {"near": near_peak, "value": peak, "window_min": PEAK_WINDOW_MIN},
+        "dip": {"near": near_dip, "value": dip, "window_min": PEAK_WINDOW_MIN},
+        "events": events,
+        "paper": {"usd": float(_paper["usd"]), "equity": float(_paper["equity"]), "unreal_pnl": float(_paper["unreal_pnl"]),
+                  "pos": _paper["pos"], "trades": _paper_trades[-50:]},
+        "real": {"trades": _real_trades[-50:]},
+        "candles_15m": _serialize(c15, 120),
+        "candles_5m": _serialize(c5, 240),
+    }
+
+
+def _engine_loop() -> None:
+    global _last_broadcast_sig
+    while True:
+        try:
+            new_state = _build_state()
+            with _state_lock:
+                _state.clear()
+                _state.update(new_state)
+
+            # Optional push updates to TELEGRAM_CHAT_ID when setup changes
+            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                sig = f"{new_state.get('signal')}|{new_state.get('bias_1h')}|{new_state.get('bias_6h')}|{new_state.get('peak',{}).get('near')}|{new_state.get('dip',{}).get('near')}"
+                if sig != _last_broadcast_sig:
+                    _last_broadcast_sig = sig
+                    _tg_send(
+                        TELEGRAM_CHAT_ID,
+                        f"BTC Update\nPrice: ${new_state['price']:.2f}\nSignal: {new_state['signal']} ({new_state['confidence']:.0f}%)\nBias(1h/6h): {new_state['bias_1h']}/{new_state['bias_6h']}"
+                    )
+        except Exception as e:
+            with _state_lock:
+                _state.clear()
+                _state.update({"ok": False, "error": str(e), "iso": _utc_iso()})
+        time.sleep(max(2, REFRESH_SEC))
+
+
 @app.on_event("startup")
-def _startup():
-    threading.Thread(target=engine_loop, daemon=True).start()
-    if TG_TOKEN and ENABLE_TELEGRAM:
-        threading.Thread(target=telegram_poll_loop, daemon=True).start()
+def _startup() -> None:
+    threading.Thread(target=_engine_loop, daemon=True).start()
+    if TELEGRAM_TOKEN:
+        threading.Thread(target=_tg_poll_loop, daemon=True).start()
+
 
 @app.get("/health")
-def health():
+def health() -> Dict[str, Any]:
+    # MUST be fast and never do network calls.
     with _state_lock:
-        ok = bool(STATE.get("ok"))
-        err = STATE.get("error")
-    return {"ok": ok, "service": "btc-engine", "version": APP_VERSION, "product": PRODUCT_ID, "time": datetime.now(timezone.utc).isoformat(), "error": err}
+        ok = bool(_state.get("ok"))
+        iso = _state.get("iso", _utc_iso())
+        err = _state.get("error")
+    return {"ok": True, "engine_ok": ok, "version": VERSION, "iso": iso, "error": err}
+
 
 @app.get("/state")
-def state():
+def state() -> Dict[str, Any]:
     with _state_lock:
-        s = dict(STATE)
-    price = s.get("price") if isinstance(s.get("price"), (int, float)) else None
-    PAPER["equity"] = PAPER["usd"] + PAPER["btc"] * price if price else PAPER["usd"]
-    s["paper"] = dict(PAPER)
-    s["paper_trades_count"] = len(paper_trades)
-    s["real_trades_count"] = len(real_trades)
-    return s
+        return dict(_state)
 
-@app.get("/candles")
-def candles(tf: str = "15m", limit: int = 200):
-    tf_map = {"5m": RSI_5M_GRAN_SEC, "15m": EXEC_GRAN_SEC, "1h": BIAS_1H_GRAN_SEC, "6h": BIAS_6H_GRAN_SEC}
-    gran = tf_map.get(tf, EXEC_GRAN_SEC)
-    data = fetch_candles(gran, max(10, min(500, int(limit))))
-    return {"ok": True, "tf": tf, "gran_sec": gran, "candles": data}
 
-@app.get("/trades/paper")
-def get_paper_trades(limit: int = 500):
-    return {"ok": True, "paper": dict(PAPER), "trades": paper_trades[-max(1, min(5000, int(limit))):]}
+@app.get("/trades")
+def trades() -> Dict[str, Any]:
+    return {"paper": _paper_trades, "real": _real_trades}
 
-@app.get("/trades/real")
-def get_real_trades(limit: int = 500):
-    return {"ok": True, "trades": real_trades[-max(1, min(5000, int(limit))):]}
-
-@app.post("/trades/real")
-def log_real_trade(payload: Dict[str, Any] = Body(...)):
-    trade = {"ts": payload.get("ts") or datetime.now(timezone.utc).isoformat(), "side": str(payload.get("side", "")).upper(), "qty": float(payload.get("qty") or 0), "price": float(payload.get("price") or 0), "note": payload.get("note") or ""}
-    real_trades.append(trade)
-    persist_all()
-    return {"ok": True, "trade": trade, "count": len(real_trades)}
 
 @app.post("/paper/reset")
-def reset_paper():
-    PAPER.update({"usd": PAPER_START_USD, "btc": 0.0, "equity": PAPER_START_USD, "pos_entry": None, "pos_side": None, "realized_pnl": 0.0})
-    paper_trades.clear()
-    persist_all()
-    return {"ok": True, "paper": dict(PAPER)}
+def paper_reset() -> Dict[str, Any]:
+    _paper_trades.clear()
+    _paper["usd"] = PAPER_START_USD
+    _paper["btc"] = 0.0
+    _paper["pos"] = None
+    _paper["equity"] = PAPER_START_USD
+    _paper["unreal_pnl"] = 0.0
+    return {"ok": True}
+
+
+@app.post("/real/log")
+def real_log(trade: Dict[str, Any]) -> Dict[str, Any]:
+    trade = dict(trade)
+    trade.setdefault("ts", _utc_iso())
+    _real_trades.append(trade)
+    return {"ok": True, "count": len(_real_trades)}
