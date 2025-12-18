@@ -1,507 +1,625 @@
 import os
 import time
+import math
+import json
+import uuid
+import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 import numpy as np
 import pandas as pd
-import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "2025-12-17"
+# =========================
+# Config (env)
+# =========================
+SYMBOL = os.getenv("SYMBOL", "BTC-USD")
 
-PRODUCT = os.getenv("PRODUCT", "BTC-USD")
-EXCHANGE_BASE = os.getenv("EXCHANGE_BASE", "https://api.exchange.coinbase.com").rstrip("/")
-REFRESH_SEC = int(os.getenv("REFRESH_SEC", "10"))  # background refresh cadence
-PEAK_WINDOW_MIN = int(os.getenv("PEAK_WINDOW_MIN", "180"))
-NEAR_PEAK_PCT = float(os.getenv("NEAR_PEAK_PCT", "0.003"))  # 0.3%
-NEAR_DIP_PCT = float(os.getenv("NEAR_DIP_PCT", "0.003"))
+# Timeframes in seconds supported by Coinbase Exchange candles API:
+# 60, 300, 900, 3600, 21600, 86400
+TF_5M = 300
+TF_15M = 900
+TF_1H = 3600
 
-AUTO_PAPER = os.getenv("AUTO_PAPER", "false").lower() in ("1", "true", "yes", "y")
+EXEC_TF = int(os.getenv("EXEC_TF", str(TF_15M)))  # execution timeframe (default 15m)
+BIAS_TF = int(os.getenv("BIAS_TF", str(TF_1H)))   # bias timeframe (default 1h)
+REFRESH_SEC = float(os.getenv("ENGINE_LOOP_SEC", "10"))  # engine loop
+
+MIN_CONF_TRADE = float(os.getenv("MIN_CONF_TRADE", "0.60"))  # 0-1
 PAPER_START_USD = float(os.getenv("PAPER_START_USD", "250"))
-PAPER_RISK_PCT = float(os.getenv("PAPER_RISK_PCT", "0.01"))  # risk 1% of equity per trade (paper)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # if set, only respond to this chat id
+ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.8"))
+ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "2.2"))
 
-app = FastAPI(title="BTC Engine", version=VERSION)
+MAX_CANDLES = int(os.getenv("MAX_CANDLES", "200"))
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+COINBASE_BASE = os.getenv("COINBASE_BASE", "https://api.exchange.coinbase.com").rstrip("/")
 
-_state_lock = threading.Lock()
-_state: Dict[str, Any] = {"ok": False, "error": "starting"}
-_last_broadcast_sig: Optional[str] = None
+DB_PATH = os.getenv("DB_PATH", "trades.db")
 
-_paper = {
-    "usd": PAPER_START_USD,
-    "btc": 0.0,
-    "pos": None,  # {"side": "LONG"/"SHORT", "qty": float, "entry": float, "sl": float, "tp": float, "ts": iso}
-    "equity": PAPER_START_USD,
-    "unreal_pnl": 0.0,
-}
-_paper_trades: List[Dict[str, Any]] = []
-_real_trades: List[Dict[str, Any]] = []
-
-
-def _utc_iso() -> str:
+# =========================
+# Helpers
+# =========================
+def now_utc_iso():
     return datetime.now(timezone.utc).isoformat()
 
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
-def _tg_api(method: str, payload: dict, timeout: float = 10.0) -> Any:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-    r = requests.post(url, json=payload, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-
-def _tg_send(chat_id: str, text: str) -> None:
-    if not TELEGRAM_TOKEN:
-        return
+def safe_float(x, default=None):
     try:
-        _tg_api("sendMessage", {"chat_id": chat_id, "text": text}, timeout=8.0)
+        return float(x)
     except Exception:
-        pass
+        return default
 
-
-def _tg_allowed(chat_id: str) -> bool:
-    return (not TELEGRAM_CHAT_ID) or (str(chat_id) == str(TELEGRAM_CHAT_ID))
-
-
-def _tg_poll_loop() -> None:
-    # Poll Telegram so the bot can reply to: /health, /status, /trades
-    if not TELEGRAM_TOKEN:
-        return
-
-    offset = 0
-    while True:
-        try:
-            resp = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params={"timeout": 30, "offset": offset},
-                timeout=35,
-            ).json()
-
-            for upd in resp.get("result", []):
-                offset = max(offset, int(upd.get("update_id", 0)) + 1)
-                msg = upd.get("message") or upd.get("edited_message") or {}
-                text = (msg.get("text") or "").strip()
-                chat = msg.get("chat") or {}
-                chat_id = str(chat.get("id", ""))
-
-                if not (chat_id and text):
-                    continue
-                if not _tg_allowed(chat_id):
-                    continue
-
-                cmd = text.split()[0].lower()
-                if cmd == "/health":
-                    with _state_lock:
-                        ok = bool(_state.get("ok"))
-                        iso = _state.get("iso", _utc_iso())
-                        err = _state.get("error")
-                    _tg_send(chat_id, f"✅ Health\nengine_ok: {ok}\niso: {iso}\nerror: {err}")
-                elif cmd in ("/status", "/state"):
-                    with _state_lock:
-                        s = dict(_state)
-                    if not s.get("ok"):
-                        _tg_send(chat_id, f"⏳ Engine not ready.\nerror: {s.get('error')}\niso: {s.get('iso')}")
-                    else:
-                        _tg_send(
-                            chat_id,
-                            "📊 Status\n"
-                            f"Price: ${s.get('price', 0):,.2f}\n"
-                            f"Signal: {s.get('signal')} ({float(s.get('confidence', 0.0)):.0f}%)\n"
-                            f"Bias(1h/6h): {s.get('bias_1h')}/{s.get('bias_6h')}\n"
-                            f"RSI(5m/15m): {s.get('rsi_5m')} / {s.get('rsi_15m')}\n"
-                            f"SL/TP: {s.get('sl')} / {s.get('tp')}\n"
-                            f"iso: {s.get('iso')}",
-                        )
-                elif cmd == "/trades":
-                    last = _paper_trades[-5:]
-                    if not last:
-                        _tg_send(chat_id, "No paper trades yet.")
-                    else:
-                        lines = [
-                            f"{t.get('ts','')[-8:]} {t.get('type')} {t.get('side','')} @ {t.get('price','')}"
-                            for t in last
-                        ]
-                        _tg_send(chat_id, "🧪 Last paper trades:\n" + "\n".join(lines))
-                elif cmd in ("/start", "/help"):
-                    _tg_send(chat_id, "Commands: /health /status /trades")
-        except Exception:
-            pass
-
-        time.sleep(2)
-
-
-def _fetch_json(url: str, params: Optional[dict] = None, timeout: float = 8.0) -> Any:
-    r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": "btc-engine/1.0"})
+def fetch_candles(symbol: str, granularity: int, limit: int = 200) -> pd.DataFrame:
+    """
+    Coinbase Exchange candles endpoint returns [time, low, high, open, close, volume]
+    time is unix seconds. We'll return ascending time DataFrame with columns:
+    t, o, h, l, c, v
+    """
+    url = f"{COINBASE_BASE}/products/{symbol}/candles"
+    # Coinbase returns newest-first; we reverse later
+    params = {"granularity": granularity}
+    r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    if not isinstance(data, list) or len(data) == 0:
+        return pd.DataFrame(columns=["t", "o", "h", "l", "c", "v"])
 
-
-def fetch_spot_price() -> float:
-    data = _fetch_json(f"{EXCHANGE_BASE}/products/{PRODUCT}/ticker", timeout=6.0)
-    return float(data["price"])
-
-
-def fetch_candles(granularity_sec: int) -> pd.DataFrame:
-    raw = _fetch_json(
-        f"{EXCHANGE_BASE}/products/{PRODUCT}/candles",
-        params={"granularity": granularity_sec},
-        timeout=10.0,
-    )
-    df = pd.DataFrame(raw, columns=["time", "low", "high", "open", "close", "volume"])
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df = df.sort_values("time").reset_index(drop=True)
-    for c in ["low", "high", "open", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close"])
+    # Each row: [time, low, high, open, close, volume]
+    df = pd.DataFrame(data, columns=["t", "l", "h", "o", "c", "v"])
+    df = df.sort_values("t").tail(limit).reset_index(drop=True)
+    df["t"] = pd.to_datetime(df["t"], unit="s", utc=True)
+    # ensure numeric
+    for col in ["o", "h", "l", "c", "v"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["o", "h", "l", "c"]).reset_index(drop=True)
     return df
-
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    roll_up = up.ewm(alpha=1/period, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(method="bfill").fillna(50)
 
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
-
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    m = ema(series, fast) - ema(series, slow)
-    s = ema(m, signal)
-    h = m - s
-    return m, s, h
-
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
+    high = df["h"]
+    low = df["l"]
+    close = df["c"]
     prev_close = close.shift(1)
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    out = tr.ewm(alpha=1/period, adjust=False).mean()
+    return out.fillna(method="bfill")
 
+# =========================
+# Trade DB (SQLite)
+# =========================
+def db_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def bias_from_ma(df: pd.DataFrame, span: int = 20) -> str:
-    if len(df) < span + 2:
-        return "UNKNOWN"
-    ma = ema(df["close"], span)
-    return "UP" if df["close"].iloc[-1] >= ma.iloc[-1] else "DOWN"
-
-
-def _paper_mark_to_market(price: float) -> None:
-    pos = _paper["pos"]
-    if pos is None:
-        _paper["equity"] = _paper["usd"] + _paper["btc"] * price
-        _paper["unreal_pnl"] = 0.0
-        return
-
-    qty = float(pos["qty"])
-    entry = float(pos["entry"])
-    unreal = (price - entry) * qty if pos["side"] == "LONG" else (entry - price) * qty
-    _paper["unreal_pnl"] = float(unreal)
-    _paper["equity"] = float(_paper["usd"] + unreal)
-
-
-def _paper_enter(side: str, price: float, atr_val: float, reason: str, confidence: float) -> None:
-    if _paper["pos"] is not None:
-        return
-
-    equity = float(_paper.get("equity", _paper["usd"]))
-    risk_dollars = max(1.0, equity * PAPER_RISK_PCT)
-    sl_mult = 1.2
-    tp_mult = 2.0
-    if atr_val <= 0 or np.isnan(atr_val):
-        atr_val = max(10.0, price * 0.001)
-
-    if side == "BUY":
-        sl = price - atr_val * sl_mult
-        tp = price + atr_val * tp_mult
-        per_unit_risk = max(1e-9, price - sl)
-        qty = risk_dollars / per_unit_risk
-        _paper["pos"] = {"side": "LONG", "qty": float(qty), "entry": float(price), "sl": float(sl), "tp": float(tp), "ts": _utc_iso()}
-    else:
-        sl = price + atr_val * sl_mult
-        tp = price - atr_val * tp_mult
-        per_unit_risk = max(1e-9, sl - price)
-        qty = risk_dollars / per_unit_risk
-        _paper["pos"] = {"side": "SHORT", "qty": float(qty), "entry": float(price), "sl": float(sl), "tp": float(tp), "ts": _utc_iso()}
-
-    _paper_trades.append(
-        {"ts": _utc_iso(), "type": "ENTRY", "side": side, "price": float(price), "qty": float(_paper["pos"]["qty"]),
-         "sl": float(_paper["pos"]["sl"]), "tp": float(_paper["pos"]["tp"]), "reason": reason, "confidence": float(confidence)}
+def db_init():
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS paper_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
     )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS paper_trades (
+        id TEXT PRIMARY KEY,
+        side TEXT NOT NULL,
+        entry REAL NOT NULL,
+        sl REAL NOT NULL,
+        tp REAL NOT NULL,
+        confidence REAL NOT NULL,
+        opened_at TEXT NOT NULL,
+        status TEXT NOT NULL,
+        exit_price REAL,
+        closed_at TEXT,
+        pnl_usd REAL,
+        pnl_r REAL,
+        reason TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS real_trades (
+        id TEXT PRIMARY KEY,
+        side TEXT NOT NULL,
+        entry REAL NOT NULL,
+        exit_price REAL,
+        opened_at TEXT NOT NULL,
+        closed_at TEXT,
+        pnl_usd REAL,
+        note TEXT
+    )
+    """)
+    con.commit()
 
+    # initialize starting equity once
+    cur.execute("SELECT value FROM paper_state WHERE key='equity_usd'")
+    row = cur.fetchone()
+    if row is None:
+        cur.execute("INSERT INTO paper_state(key,value) VALUES(?,?)", ("equity_usd", json.dumps(PAPER_START_USD)))
+        cur.execute("INSERT INTO paper_state(key,value) VALUES(?,?)", ("pos_btc", json.dumps(0.0)))
+        con.commit()
 
-def _paper_check_exit(price: float) -> None:
-    pos = _paper["pos"]
-    if pos is None:
-        return
-    sl = float(pos["sl"])
-    tp = float(pos["tp"])
-    entry = float(pos["entry"])
-    qty = float(pos["qty"])
+    con.close()
 
-    hit = None
-    pnl = 0.0
-    if pos["side"] == "LONG":
-        if price <= sl:
-            hit = "SL"
-        elif price >= tp:
-            hit = "TP"
-        if hit:
-            pnl = (price - entry) * qty
-    else:
-        if price >= sl:
-            hit = "SL"
-        elif price <= tp:
-            hit = "TP"
-        if hit:
-            pnl = (entry - price) * qty
+def get_paper_equity():
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT value FROM paper_state WHERE key='equity_usd'")
+    row = cur.fetchone()
+    con.close()
+    return float(json.loads(row[0])) if row else PAPER_START_USD
 
-    if hit:
-        _paper["usd"] = float(_paper["usd"] + pnl)
-        _paper_trades.append({"ts": _utc_iso(), "type": "EXIT", "hit": hit, "price": float(price), "pnl": float(pnl), "equity": float(_paper["usd"])})
-        _paper["pos"] = None
-        _paper_mark_to_market(price)
+def set_paper_equity(x: float):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO paper_state(key,value) VALUES(?,?)", ("equity_usd", json.dumps(float(x))))
+    con.commit()
+    con.close()
 
-
-def compute_signal(
-    price: float,
-    rsi5: Optional[float],
-    macd_hist_15: Optional[float],
-    macd_hist_15_prev: Optional[float],
-    b1h: str,
-    b6h: str,
-    atr15: Optional[float],
-    near_peak: bool,
-    near_dip: bool,
-) -> Tuple[str, float, str]:
-    reasons = []
-    long_ok = (b1h == "UP" and b6h == "UP")
-    short_ok = (b1h == "DOWN" and b6h == "DOWN")
-
-    if b1h != "UNKNOWN":
-        reasons.append(f"1h bias {b1h.lower()}")
-    if b6h != "UNKNOWN":
-        reasons.append(f"6h bias {b6h.lower()}")
-
-    if rsi5 is not None:
-        if rsi5 <= 35:
-            reasons.append("RSI5 oversold")
-        if rsi5 >= 65:
-            reasons.append("RSI5 overbought")
-
-    macd_up = macd_hist_15 is not None and macd_hist_15_prev is not None and macd_hist_15 > macd_hist_15_prev
-    macd_down = macd_hist_15 is not None and macd_hist_15_prev is not None and macd_hist_15 < macd_hist_15_prev
-
-    if near_peak:
-        reasons.append("near rolling peak")
-    if near_dip:
-        reasons.append("near rolling dip")
-
-    signal = "WAIT"
-    if long_ok and (rsi5 is not None and rsi5 <= 35) and macd_up and not near_peak:
-        signal = "BUY"
-    elif short_ok and (rsi5 is not None and rsi5 >= 65) and macd_down and not near_dip:
-        signal = "SELL"
-
-    conf = 20.0 if signal == "WAIT" else 35.0
-    if signal == "BUY":
-        if rsi5 is not None and rsi5 <= 30:
-            conf += 10
-        if macd_up:
-            conf += 15
-        conf += (10 if b1h == "UP" else 0) + (10 if b6h == "UP" else 0)
-        conf += 5 if (atr15 is not None and not np.isnan(atr15)) else 0
-    elif signal == "SELL":
-        if rsi5 is not None and rsi5 >= 70:
-            conf += 10
-        if macd_down:
-            conf += 15
-        conf += (10 if b1h == "DOWN" else 0) + (10 if b6h == "DOWN" else 0)
-        conf += 5 if (atr15 is not None and not np.isnan(atr15)) else 0
-
-    conf = float(max(0.0, min(100.0, conf)))
-    return signal, conf, "; ".join(reasons[:6]) if reasons else "no setup"
-
-
-def _build_state() -> Dict[str, Any]:
-    t0 = time.time()
-
-    c5 = fetch_candles(300)
-    c15 = fetch_candles(900)
-    c1h = fetch_candles(3600)
-    c6h = fetch_candles(21600)
-
-    price = float(c5["close"].iloc[-1]) if len(c5) else fetch_spot_price()
-
-    rsi5_val = float(rsi(c5["close"]).iloc[-1]) if len(c5) >= 20 else None
-    rsi15_val = float(rsi(c15["close"]).iloc[-1]) if len(c15) >= 20 else None
-
-    _, _, h15 = macd(c15["close"]) if len(c15) >= 40 else (None, None, None)
-    macd_hist_15 = float(h15.iloc[-1]) if h15 is not None else None
-    macd_hist_15_prev = float(h15.iloc[-2]) if h15 is not None and len(h15) >= 2 else None
-
-    atr15_series = atr(c15) if len(c15) >= 20 else None
-    atr15_val = float(atr15_series.iloc[-1]) if atr15_series is not None else None
-
-    b1h = bias_from_ma(c1h)
-    b6h = bias_from_ma(c6h)
-
-    n = max(5, int(PEAK_WINDOW_MIN / 5))
-    peak = float(c5["high"].tail(n).max()) if len(c5) else price
-    dip = float(c5["low"].tail(n).min()) if len(c5) else price
-    near_peak = (peak - price) / peak <= NEAR_PEAK_PCT if peak > 0 else False
-    near_dip = (price - dip) / price <= NEAR_DIP_PCT if price > 0 else False
-
-    signal, conf, reason = compute_signal(price, rsi5_val, macd_hist_15, macd_hist_15_prev, b1h, b6h, atr15_val, near_peak, near_dip)
-
-    sl = tp = None
-    if atr15_val is not None and not np.isnan(atr15_val):
-        sl_mult = 1.2
-        tp_mult = 2.0
-        if signal == "BUY":
-            sl = price - atr15_val * sl_mult
-            tp = price + atr15_val * tp_mult
-        elif signal == "SELL":
-            sl = price + atr15_val * sl_mult
-            tp = price - atr15_val * tp_mult
-
-    _paper_mark_to_market(price)
-    _paper_check_exit(price)
-    if AUTO_PAPER and signal in ("BUY", "SELL"):
-        _paper_enter(signal, price, atr15_val or 0.0, reason=reason, confidence=conf)
-
-    events: List[Dict[str, Any]] = []
-    if near_peak:
-        events.append({"type": "PEAK_WATCH", "price": price, "near_peak": peak, "window_min": PEAK_WINDOW_MIN})
-    if near_dip:
-        events.append({"type": "DIP_WATCH", "price": price, "near_dip": dip, "window_min": PEAK_WINDOW_MIN})
-
-    def _serialize(df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
-        d = df.tail(limit).copy()
-        out = []
-        for _, row in d.iterrows():
-            out.append(
-                {"time": row["time"].isoformat(), "open": float(row["open"]), "high": float(row["high"]),
-                 "low": float(row["low"]), "close": float(row["close"]), "volume": float(row.get("volume", 0.0))}
-            )
-        return out
-
+def get_open_paper_trade():
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT id, side, entry, sl, tp, confidence, opened_at, status, reason FROM paper_trades WHERE status='OPEN' ORDER BY opened_at DESC LIMIT 1")
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
     return {
-        "ok": True,
-        "version": VERSION,
-        "iso": _utc_iso(),
-        "latency_ms": int((time.time() - t0) * 1000),
-        "src": "Coinbase Exchange",
-        "product": PRODUCT,
-        "price": price,
-        "signal": signal,
-        "confidence": conf,
-        "reason": reason,
-        "bias_1h": b1h,
-        "bias_6h": b6h,
-        "rsi_5m": rsi5_val,
-        "rsi_15m": rsi15_val,
-        "macd_hist_15m": macd_hist_15,
-        "atr_15m": atr15_val,
-        "sl": sl,
-        "tp": tp,
-        "peak": {"near": near_peak, "value": peak, "window_min": PEAK_WINDOW_MIN},
-        "dip": {"near": near_dip, "value": dip, "window_min": PEAK_WINDOW_MIN},
-        "events": events,
-        "paper": {"usd": float(_paper["usd"]), "equity": float(_paper["equity"]), "unreal_pnl": float(_paper["unreal_pnl"]),
-                  "pos": _paper["pos"], "trades": _paper_trades[-50:]},
-        "real": {"trades": _real_trades[-50:]},
-        "candles_15m": _serialize(c15, 120),
-        "candles_5m": _serialize(c5, 240),
+        "id": row[0],
+        "side": row[1],
+        "entry": row[2],
+        "sl": row[3],
+        "tp": row[4],
+        "confidence": row[5],
+        "opened_at": row[6],
+        "status": row[7],
+        "reason": row[8],
     }
 
+def insert_open_trade(tr):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+    INSERT INTO paper_trades(id,side,entry,sl,tp,confidence,opened_at,status,reason)
+    VALUES(?,?,?,?,?,?,?,?,?)
+    """, (
+        tr["id"], tr["side"], tr["entry"], tr["sl"], tr["tp"], tr["confidence"],
+        tr["opened_at"], tr["status"], tr.get("reason","")
+    ))
+    con.commit()
+    con.close()
 
-def _engine_loop() -> None:
-    global _last_broadcast_sig
-    while True:
-        try:
-            new_state = _build_state()
-            with _state_lock:
-                _state.clear()
-                _state.update(new_state)
+def close_trade(trade_id: str, exit_price: float, pnl_usd: float, pnl_r: float):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+    UPDATE paper_trades
+    SET status='CLOSED', exit_price=?, closed_at=?, pnl_usd=?, pnl_r=?
+    WHERE id=?
+    """, (float(exit_price), now_utc_iso(), float(pnl_usd), float(pnl_r), trade_id))
+    con.commit()
+    con.close()
 
-            # Optional push updates to TELEGRAM_CHAT_ID when setup changes
-            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-                sig = f"{new_state.get('signal')}|{new_state.get('bias_1h')}|{new_state.get('bias_6h')}|{new_state.get('peak',{}).get('near')}|{new_state.get('dip',{}).get('near')}"
-                if sig != _last_broadcast_sig:
-                    _last_broadcast_sig = sig
-                    _tg_send(
-                        TELEGRAM_CHAT_ID,
-                        f"BTC Update\nPrice: ${new_state['price']:.2f}\nSignal: {new_state['signal']} ({new_state['confidence']:.0f}%)\nBias(1h/6h): {new_state['bias_1h']}/{new_state['bias_6h']}"
-                    )
-        except Exception as e:
-            with _state_lock:
-                _state.clear()
-                _state.update({"ok": False, "error": str(e), "iso": _utc_iso()})
-        time.sleep(max(2, REFRESH_SEC))
+def list_trades(table: str, limit: int = 200):
+    con = db_conn()
+    cur = con.cursor()
+    if table == "paper_trades":
+        cur.execute("""
+        SELECT id, side, entry, sl, tp, confidence, opened_at, status, exit_price, closed_at, pnl_usd, pnl_r, reason
+        FROM paper_trades
+        ORDER BY opened_at DESC
+        LIMIT ?
+        """, (limit,))
+        rows = cur.fetchall()
+        con.close()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r[0], "side": r[1], "entry": r[2], "sl": r[3], "tp": r[4],
+                "confidence": r[5], "opened_at": r[6], "status": r[7],
+                "exit_price": r[8], "closed_at": r[9], "pnl_usd": r[10], "pnl_r": r[11],
+                "reason": r[12]
+            })
+        return out
 
+    if table == "real_trades":
+        cur.execute("""
+        SELECT id, side, entry, exit_price, opened_at, closed_at, pnl_usd, note
+        FROM real_trades
+        ORDER BY opened_at DESC
+        LIMIT ?
+        """, (limit,))
+        rows = cur.fetchall()
+        con.close()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r[0], "side": r[1], "entry": r[2], "exit_price": r[3],
+                "opened_at": r[4], "closed_at": r[5], "pnl_usd": r[6], "note": r[7]
+            })
+        return out
 
-@app.on_event("startup")
-def _startup() -> None:
-    threading.Thread(target=_engine_loop, daemon=True).start()
-    if TELEGRAM_TOKEN:
-        threading.Thread(target=_tg_poll_loop, daemon=True).start()
+    con.close()
+    return []
 
+# =========================
+# Strategy & Paper execution
+# =========================
+def compute_signal(exec_df: pd.DataFrame, bias_df: pd.DataFrame):
+    """
+    Outputs:
+      signal: "BUY" | "SELL" | "WAIT"
+      confidence: 0..1
+      trend_bias: "UP" | "DOWN" | "UNKNOWN"
+      details dict for /explain
+    """
+    details = {}
+
+    if len(exec_df) < 50 or len(bias_df) < 50:
+        return "WAIT", 0.0, "UNKNOWN", {"reason": "Not enough candle data yet."}
+
+    price = float(exec_df["c"].iloc[-1])
+    details["price"] = price
+
+    # indicators on exec timeframe
+    rsi_exec = float(rsi(exec_df["c"], 14).iloc[-1])
+    macd_line, macd_sig, macd_hist = macd(exec_df["c"])
+    macd_hist_now = float(macd_hist.iloc[-1])
+    atr_exec = float(atr(exec_df, 14).iloc[-1])
+
+    details["rsi_exec"] = rsi_exec
+    details["macd_hist_exec"] = macd_hist_now
+    details["atr_exec"] = atr_exec
+
+    # bias on 1h (or configured)
+    # Simple bias: price vs EMA(50) and MACD histogram direction
+    bias_ema = float(ema(bias_df["c"], 50).iloc[-1])
+    bias_macd_hist = float(macd(bias_df["c"])[2].iloc[-1])
+
+    trend_bias = "UNKNOWN"
+    if bias_df["c"].iloc[-1] > bias_ema and bias_macd_hist >= 0:
+        trend_bias = "UP"
+    elif bias_df["c"].iloc[-1] < bias_ema and bias_macd_hist <= 0:
+        trend_bias = "DOWN"
+
+    details["bias_ema50"] = bias_ema
+    details["bias_macd_hist"] = bias_macd_hist
+    details["trend_bias"] = trend_bias
+
+    # Scoring (heuristic, deterministic)
+    # Momentum factors:
+    bull = 0.0
+    bear = 0.0
+
+    # RSI: prefer buying when RSI recovering from low, selling when RSI falling from high
+    if rsi_exec <= 30:
+        bull += 0.25
+    elif rsi_exec >= 70:
+        bear += 0.25
+
+    # MACD histogram sign
+    if macd_hist_now > 0:
+        bull += 0.25
+    elif macd_hist_now < 0:
+        bear += 0.25
+
+    # Bias alignment boost
+    if trend_bias == "UP":
+        bull += 0.20
+    elif trend_bias == "DOWN":
+        bear += 0.20
+
+    # Volatility sanity: very tiny ATR -> reduce confidence (chop); very huge -> also reduce a bit
+    # normalize ATR by price
+    atrp = atr_exec / price if price > 0 else 0
+    details["atr_pct"] = atrp
+    vol_penalty = 0.0
+    if atrp < 0.0015:   # very low range
+        vol_penalty = 0.10
+    elif atrp > 0.02:   # extremely volatile
+        vol_penalty = 0.07
+
+    # Decide
+    raw_conf = max(bull, bear) - vol_penalty
+    raw_conf = clamp(raw_conf, 0.0, 0.95)
+
+    if bull > bear and raw_conf >= 0.45:
+        return "BUY", raw_conf, trend_bias, {**details, "bull": bull, "bear": bear, "vol_penalty": vol_penalty}
+    if bear > bull and raw_conf >= 0.45:
+        return "SELL", raw_conf, trend_bias, {**details, "bull": bull, "bear": bear, "vol_penalty": vol_penalty}
+
+    return "WAIT", raw_conf, trend_bias, {**details, "bull": bull, "bear": bear, "vol_penalty": vol_penalty, "reason": "No high-probability setup."}
+
+def maybe_open_paper_trade(signal: str, confidence: float, price: float, atr_value: float, reason: str):
+    open_trade = get_open_paper_trade()
+    if open_trade is not None:
+        return None  # already in a trade
+
+    if confidence < MIN_CONF_TRADE:
+        return None
+
+    side = None
+    if signal == "BUY":
+        side = "LONG"
+    elif signal == "SELL":
+        side = "SHORT"
+    else:
+        return None
+
+    # ATR-based stops
+    if atr_value is None or atr_value <= 0:
+        return None
+
+    if side == "LONG":
+        sl = price - ATR_MULT_SL * atr_value
+        tp = price + ATR_MULT_TP * atr_value
+    else:
+        sl = price + ATR_MULT_SL * atr_value
+        tp = price - ATR_MULT_TP * atr_value
+
+    tr = {
+        "id": str(uuid.uuid4()),
+        "side": side,
+        "entry": float(price),
+        "sl": float(sl),
+        "tp": float(tp),
+        "confidence": float(confidence),
+        "opened_at": now_utc_iso(),
+        "status": "OPEN",
+        "reason": reason,
+    }
+    insert_open_trade(tr)
+    return tr
+
+def maybe_close_paper_trade(latest_price: float):
+    tr = get_open_paper_trade()
+    if tr is None:
+        return None
+
+    side = tr["side"]
+    entry = tr["entry"]
+    sl = tr["sl"]
+    tp = tr["tp"]
+
+    hit = None
+    if side == "LONG":
+        if latest_price <= sl:
+            hit = "SL"
+        elif latest_price >= tp:
+            hit = "TP"
+    else:  # SHORT
+        if latest_price >= sl:
+            hit = "SL"
+        elif latest_price <= tp:
+            hit = "TP"
+
+    if not hit:
+        return None
+
+    # PnL model: use 1 unit notional sizing based on equity with fixed risk? (simple baseline)
+    # We'll do a simple "1x" position size: invest 100% equity as notional on paper
+    equity = get_paper_equity()
+    notional = equity  # baseline; later we'll optimize sizing
+    qty_btc = notional / entry if entry > 0 else 0
+
+    if side == "LONG":
+        pnl_usd = (latest_price - entry) * qty_btc
+    else:
+        pnl_usd = (entry - latest_price) * qty_btc
+
+    # R-multiple: distance to SL in price terms
+    risk_per_btc = abs(entry - sl)
+    r = (abs(latest_price - entry) / risk_per_btc) if risk_per_btc > 0 else 0.0
+    if hit == "SL":
+        r = -abs(r)
+
+    new_equity = max(0.0, equity + pnl_usd)
+    set_paper_equity(new_equity)
+
+    close_trade(tr["id"], latest_price, pnl_usd, r)
+    return {"closed": tr["id"], "hit": hit, "exit": latest_price, "pnl_usd": pnl_usd, "equity": new_equity}
+
+# =========================
+# Engine state
+# =========================
+STATE_LOCK = threading.Lock()
+ENGINE_STATE = {
+    "ok": False,
+    "time": "",
+    "iso": "",
+    "symbol": SYMBOL,
+    "price": None,
+    "signal": "WAIT",
+    "confidence": 0.0,
+    "trend_bias": "UNKNOWN",
+    "rsi_5m": None,
+    "rsi_exec": None,
+    "atr_exec": None,
+    "reason": "",
+    "error": None,
+    "candles_exec": [],
+    "paper_equity": PAPER_START_USD,
+    "paper_open_trade": None,
+}
+
+LAST_EXPLAIN = {}
+
+def set_state(**kwargs):
+    with STATE_LOCK:
+        ENGINE_STATE.update(kwargs)
+
+def get_state():
+    with STATE_LOCK:
+        return dict(ENGINE_STATE)
+
+# =========================
+# FastAPI app
+# =========================
+app = FastAPI(title="BTC Engine", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
-def health() -> Dict[str, Any]:
-    # MUST be fast and never do network calls.
-    with _state_lock:
-        ok = bool(_state.get("ok"))
-        iso = _state.get("iso", _utc_iso())
-        err = _state.get("error")
-    return {"ok": True, "engine_ok": ok, "version": VERSION, "iso": iso, "error": err}
-
+def health():
+    st = get_state()
+    return {"ok": bool(st.get("ok")), "time": st.get("time"), "iso": st.get("iso"), "symbol": SYMBOL}
 
 @app.get("/state")
-def state() -> Dict[str, Any]:
-    with _state_lock:
-        return dict(_state)
+def state():
+    return get_state()
 
+@app.get("/explain")
+def explain():
+    return {"ok": True, "explain": LAST_EXPLAIN, "min_conf_trade": MIN_CONF_TRADE}
 
 @app.get("/trades")
-def trades() -> Dict[str, Any]:
-    return {"paper": _paper_trades, "real": _real_trades}
+def trades():
+    paper = list_trades("paper_trades", limit=200)
+    real = list_trades("real_trades", limit=200)
+    return {
+        "ok": True,
+        "paper_equity": get_paper_equity(),
+        "paper_trades": paper,
+        "real_trades": real,
+    }
 
+# =========================
+# Background engine loop
+# =========================
+def engine_loop():
+    global LAST_EXPLAIN
+    db_init()
 
-@app.post("/paper/reset")
-def paper_reset() -> Dict[str, Any]:
-    _paper_trades.clear()
-    _paper["usd"] = PAPER_START_USD
-    _paper["btc"] = 0.0
-    _paper["pos"] = None
-    _paper["equity"] = PAPER_START_USD
-    _paper["unreal_pnl"] = 0.0
-    return {"ok": True}
+    while True:
+        t0 = time.time()
+        try:
+            # candles for exec & bias
+            exec_df = fetch_candles(SYMBOL, EXEC_TF, limit=MAX_CANDLES)
+            bias_df = fetch_candles(SYMBOL, BIAS_TF, limit=MAX_CANDLES)
 
+            if len(exec_df) == 0 or len(bias_df) == 0:
+                set_state(
+                    ok=False,
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    iso=now_utc_iso(),
+                    error="No candle data yet.",
+                    reason="Waiting for candles…"
+                )
+                time.sleep(REFRESH_SEC)
+                continue
 
-@app.post("/real/log")
-def real_log(trade: Dict[str, Any]) -> Dict[str, Any]:
-    trade = dict(trade)
-    trade.setdefault("ts", _utc_iso())
-    _real_trades.append(trade)
-    return {"ok": True, "count": len(_real_trades)}
+            # compute RSI(5m) separately (for display)
+            df_5m = fetch_candles(SYMBOL, TF_5M, limit=MAX_CANDLES)
+            rsi_5m_val = None
+            if len(df_5m) >= 20:
+                rsi_5m_val = float(rsi(df_5m["c"], 14).iloc[-1])
+
+            # signal
+            signal, conf, trend_bias, details = compute_signal(exec_df, bias_df)
+            price = float(exec_df["c"].iloc[-1])
+            atr_exec_val = float(atr(exec_df, 14).iloc[-1]) if len(exec_df) > 20 else None
+
+            # paper exec
+            closed = maybe_close_paper_trade(price)
+            opened = None
+            if signal in ("BUY", "SELL"):
+                opened = maybe_open_paper_trade(signal, conf, price, atr_exec_val, reason=details.get("reason","signal"))
+
+            open_trade = get_open_paper_trade()
+            paper_equity = get_paper_equity()
+
+            # package candles (UI-safe keys)
+            candles_exec = []
+            if len(exec_df) > 0:
+                for _, row in exec_df.tail(120).iterrows():
+                    candles_exec.append({
+                        "t": row["t"].isoformat(),
+                        "o": float(row["o"]),
+                        "h": float(row["h"]),
+                        "l": float(row["l"]),
+                        "c": float(row["c"]),
+                        "v": float(row["v"]) if not pd.isna(row["v"]) else 0.0,
+                    })
+
+            # update explain
+            LAST_EXPLAIN = {
+                "signal": signal,
+                "confidence": conf,
+                "trend_bias": trend_bias,
+                "details": details,
+                "paper_open_trade": open_trade,
+                "paper_equity": paper_equity,
+                "last_opened": opened,
+                "last_closed": closed,
+                "exec_tf": EXEC_TF,
+                "bias_tf": BIAS_TF,
+                "source": "Coinbase Exchange candles",
+            }
+
+            set_state(
+                ok=True,
+                time=datetime.now().strftime("%H:%M:%S"),
+                iso=now_utc_iso(),
+                symbol=SYMBOL,
+                price=price,
+                signal=("WAIT" if signal == "WAIT" else ("BUY" if signal == "BUY" else "SELL")),
+                confidence=float(conf),
+                trend_bias=trend_bias,
+                rsi_5m=rsi_5m_val,
+                rsi_exec=float(details.get("rsi_exec")) if details.get("rsi_exec") is not None else None,
+                atr_exec=atr_exec_val,
+                reason=details.get("reason", ""),
+                error=None,
+                candles_exec=candles_exec,
+                paper_equity=paper_equity,
+                paper_open_trade=open_trade,
+            )
+
+        except requests.HTTPError as e:
+            # common: unsupported granularity, rate limit, etc
+            msg = f"Coinbase API error: {str(e)}"
+            set_state(ok=False, time=datetime.now().strftime("%H:%M:%S"), iso=now_utc_iso(), error=msg, reason="Engine not ready yet.")
+        except Exception as e:
+            set_state(ok=False, time=datetime.now().strftime("%H:%M:%S"), iso=now_utc_iso(), error=str(e), reason="Engine crashed in loop.")
+        finally:
+            dt = time.time() - t0
+            sleep_for = max(0.5, REFRESH_SEC - dt)
+            time.sleep(sleep_for)
+
+def start_engine_thread():
+    th = threading.Thread(target=engine_loop, daemon=True)
+    th.start()
+
+start_engine_thread()
