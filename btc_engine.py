@@ -1,4 +1,4 @@
-import os, time, uuid, sqlite3, threading, math
+import os, time, uuid, sqlite3, threading, math, json
 from datetime import datetime, timezone
 
 import requests
@@ -20,28 +20,40 @@ ENGINE_LOOP_SEC = int(os.getenv("ENGINE_LOOP_SEC", "10"))
 DB_PATH = os.getenv("DB_PATH", "trades.db")
 
 PAPER_START = float(os.getenv("PAPER_START", "250"))
-RISK_PCT = float(os.getenv("RISK_PCT", "0.10"))       # risk 10% of equity notionally (paper)
+RISK_PCT = float(os.getenv("RISK_PCT", "0.10"))       # 10% of equity notionally (paper)
 ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.8"))
 ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "2.2"))
 
 # Auto-calibration bounds
 MIN_CONF_DEFAULT = float(os.getenv("MIN_CONF", "0.60"))
-MIN_CONF_FLOOR   = float(os.getenv("MIN_CONF_FLOOR", "0.52"))
-MIN_CONF_CEIL    = float(os.getenv("MIN_CONF_CEIL", "0.78"))
+MIN_CONF_FLOOR   = float(os.getenv("MIN_CONF_FLOOR", "0.45"))
+MIN_CONF_CEIL    = float(os.getenv("MIN_CONF_CEIL", "0.80"))
 
 # Behavior
-COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "2"))  # wait N 15m candles after a close
-MAX_BARS = int(os.getenv("MAX_BARS", "240"))          # candles stored/served
+COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "2"))
+MAX_BARS = int(os.getenv("MAX_BARS", "240"))
+
+# Update #3 knobs (adaptive)
+SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "4"))   # was effectively 5; lower -> more trades
+MODEL_MIN_TRADES = int(os.getenv("MODEL_MIN_TRADES", "25"))# start learning after N closed trades
+LEARN_LR = float(os.getenv("LEARN_LR", "0.15"))
+LEARN_L2 = float(os.getenv("LEARN_L2", "1e-4"))
 
 # ================= UTILS =================
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def safe_float(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def sigmoid(x):
+    x = float(x)
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    else:
+        z = math.exp(x)
+        return z / (1.0 + z)
 
 def fetch_candles(granularity, limit=200):
     # Coinbase returns: [ time, low, high, open, close, volume ]
@@ -86,9 +98,6 @@ def atr(df, p=14):
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1/p, adjust=False).mean()
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
 # ================= DB =================
 def db():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -97,10 +106,18 @@ def init_db():
     c = db()
     cur = c.cursor()
 
+    # numeric state
     cur.execute("""
     CREATE TABLE IF NOT EXISTS state(
       k TEXT PRIMARY KEY,
       v REAL
+    )""")
+
+    # text/json state
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS state_text(
+      k TEXT PRIMARY KEY,
+      v TEXT
     )""")
 
     cur.execute("""
@@ -120,6 +137,13 @@ def init_db():
       duration_sec INTEGER
     )""")
 
+    # store entry features separately (for learning without schema migrations)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_features(
+      trade_id TEXT PRIMARY KEY,
+      f_json TEXT
+    )""")
+
     # defaults
     if not cur.execute("SELECT 1 FROM state WHERE k='equity'").fetchone():
         cur.execute("INSERT INTO state VALUES('equity',?)", (PAPER_START,))
@@ -127,6 +151,18 @@ def init_db():
         cur.execute("INSERT INTO state VALUES('min_conf',?)", (MIN_CONF_DEFAULT,))
     if not cur.execute("SELECT 1 FROM state WHERE k='cooldown_until_t'").fetchone():
         cur.execute("INSERT INTO state VALUES('cooldown_until_t',?)", (0.0,))
+
+    # model weights (Update #3)
+    if not cur.execute("SELECT 1 FROM state_text WHERE k='model_w'").fetchone():
+        # weights: [bias, rsi5_z, macd_z, ema_dist_z, atrpct_z, side_is_long]
+        cur.execute("INSERT INTO state_text VALUES('model_w',?)", (json.dumps([0,0,0,0,0,0]),))
+    if not cur.execute("SELECT 1 FROM state_text WHERE k='model_stats'").fetchone():
+        # running mean/std for z-normalization
+        cur.execute("INSERT INTO state_text VALUES('model_stats',?)", (json.dumps({
+            "n": 0,
+            "mean": [0,0,0,0,0,0],
+            "m2":   [1e-6,1e-6,1e-6,1e-6,1e-6,1e-6],
+        }),))
 
     c.commit(); c.close()
 
@@ -139,6 +175,17 @@ def get_state_num(k, default=0.0):
 def set_state_num(k, v):
     c = db()
     c.execute("INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, float(v)))
+    c.commit(); c.close()
+
+def get_state_text(k, default=""):
+    c = db()
+    row = c.execute("SELECT v FROM state_text WHERE k=?", (k,)).fetchone()
+    c.close()
+    return str(row[0]) if row else str(default)
+
+def set_state_text(k, v):
+    c = db()
+    c.execute("INSERT INTO state_text(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
     c.commit(); c.close()
 
 def equity():
@@ -190,17 +237,16 @@ def metrics():
 
 def calibrate_min_conf():
     """
-    Simple, stable calibration:
-    - bucket trades by conf ranges
-    - pick the best bucket by average pnl (with a minimum sample)
-    - set min_conf near that bucket's lower bound
+    Stable calibration:
+    - bucket trades by conf
+    - pick best bucket by avg pnl (min samples)
     """
     df = load_trades_df()
     if len(df) < 12:
         return {"ok": True, "note": "Not enough trades yet to calibrate", "min_conf": min_conf()}
 
-    # buckets: 0.50-0.55 ... 0.75-0.80
-    bins = np.arange(0.50, 0.81, 0.05)
+    bins = np.arange(0.40, 0.91, 0.05)
+    df = df.copy()
     df["bucket"] = pd.cut(df["conf"], bins=bins, include_lowest=True)
 
     grp = df.groupby("bucket").agg(
@@ -209,17 +255,13 @@ def calibrate_min_conf():
         win_rate=("pnl", lambda x: float((x>0).mean())),
     ).reset_index()
 
-    grp = grp[grp["n"] >= 4]  # minimum samples per bucket
+    grp = grp[grp["n"] >= 4]
     if grp.empty:
         return {"ok": True, "note": "No bucket has enough samples yet", "min_conf": min_conf()}
 
-    # choose best by avg_pnl, tie-break win_rate
     grp = grp.sort_values(["avg_pnl","win_rate"], ascending=False)
     best = grp.iloc[0]
-
-    # parse bucket like "(0.6, 0.65]"
     b = str(best["bucket"])
-    # extract lower number
     lo = float(b.split(",")[0].replace("(","").replace("[","").strip())
 
     new_min = clamp(lo, MIN_CONF_FLOOR, MIN_CONF_CEIL)
@@ -232,67 +274,192 @@ def calibrate_min_conf():
         "bucket_stats": grp.to_dict("records")[:8]
     }
 
-# ================= STRATEGY (SCORING) =================
+# ================= Update #3: ADAPTIVE MODEL =================
+def get_model_w():
+    return np.array(json.loads(get_state_text("model_w", "[0,0,0,0,0,0]")), dtype=float)
+
+def set_model_w(w):
+    set_state_text("model_w", json.dumps([float(x) for x in w]))
+
+def get_model_stats():
+    return json.loads(get_state_text("model_stats"))
+
+def set_model_stats(stats):
+    set_state_text("model_stats", json.dumps(stats))
+
+def _update_running_stats(stats, x):
+    # Welford update for each dimension
+    n = int(stats["n"])
+    mean = np.array(stats["mean"], dtype=float)
+    m2 = np.array(stats["m2"], dtype=float)
+
+    n2 = n + 1
+    delta = x - mean
+    mean2 = mean + delta / n2
+    delta2 = x - mean2
+    m2_2 = m2 + delta * delta2
+
+    stats["n"] = n2
+    stats["mean"] = mean2.tolist()
+    stats["m2"] = m2_2.tolist()
+    return stats
+
+def _z_norm(stats, x):
+    n = max(1, int(stats["n"]))
+    mean = np.array(stats["mean"], dtype=float)
+    m2 = np.array(stats["m2"], dtype=float)
+    var = m2 / max(1, (n - 1))
+    std = np.sqrt(np.maximum(var, 1e-6))
+    return (x - mean) / std
+
+def features_from_levels(levels, side):
+    """
+    Build a compact feature vector from your indicators.
+    Order must match model weights:
+      [bias, rsi5_z, macd_z, ema_dist_z, atrpct_z, side_is_long]
+    """
+    price = float(levels.get("price", 0.0))
+    rsi5v = float(levels.get("rsi5", 50.0))
+    macdv = float(levels.get("macd15", 0.0))
+    ema50 = float(levels.get("ema1h50", price))
+    atr15v = float(levels.get("atr15", 0.0))
+
+    # raw features (pre z)
+    f = np.array([
+        1.0,                       # bias term
+        rsi5v,
+        macdv,
+        (price - ema50),
+        (atr15v / price) if price else 0.0,
+        1.0 if side == "LONG" else 0.0
+    ], dtype=float)
+
+    return f
+
+def model_predict_prob(levels, side):
+    stats = get_model_stats()
+    w = get_model_w()
+
+    f = features_from_levels(levels, side)
+
+    # normalize all except bias
+    f2 = f.copy()
+    f2[1:] = _z_norm(stats, f[1:])
+
+    logit = float(np.dot(w, f2))
+    return sigmoid(logit)
+
+def model_train_on_trade(trade_id, won):
+    """
+    Online logistic regression update using entry features saved at open.
+    """
+    c = db()
+    row = c.execute("SELECT f_json FROM trade_features WHERE trade_id=?", (trade_id,)).fetchone()
+    c.close()
+    if not row:
+        return {"ok": False, "note": "no features for trade"}
+
+    f = np.array(json.loads(row[0]), dtype=float)
+    y = 1.0 if won else 0.0
+
+    stats = get_model_stats()
+    w = get_model_w()
+
+    # update running stats (for normalization) on f[1:]
+    stats = _update_running_stats(stats, f[1:])
+    set_model_stats(stats)
+
+    # normalize f for training
+    f2 = f.copy()
+    f2[1:] = _z_norm(stats, f[1:])
+
+    p = sigmoid(float(np.dot(w, f2)))
+    grad = (p - y) * f2 + LEARN_L2 * w
+    w2 = w - LEARN_LR * grad
+
+    set_model_w(w2)
+
+    return {"ok": True, "p_before": p, "y": y, "w": w2.tolist(), "n": int(stats["n"])}
+
+# ================= STRATEGY (BASE RULES + CONF) =================
 def score_setup(df5, df15, df1h):
     """
-    Returns: signal ("BUY"/"SELL"/"WAIT"), conf (0..1), reason (string), levels dict
-    Uses:
-      - Trend bias (1h EMA50)
-      - Momentum (15m MACD hist)
-      - Mean reversion trigger (5m RSI)
-      - Volatility sanity (15m ATR)
+    Returns: signal ("BUY"/"SELL"/"WAIT"), base_conf (0..1), reason, levels dict
     """
     price = float(df15["c"].iloc[-1])
 
-    rsi5 = float(rsi(df5["c"]).iloc[-1])
-    macd15 = float(macd_hist(df15["c"]).iloc[-1])
+    rsi5v = float(rsi(df5["c"]).iloc[-1])
+    macd15v = float(macd_hist(df15["c"]).iloc[-1])
     ema1h50 = float(ema(df1h["c"], 50).iloc[-1])
-    atr15 = float(atr(df15).iloc[-1])
+    atr15v = float(atr(df15).iloc[-1])
 
     bias_up = price > ema1h50
     bias_dn = price < ema1h50
 
-    # scoring
     score_buy = 0
     score_sell = 0
     notes = []
 
     # Bias
-    if bias_up: score_buy += 2; notes.append("bias_up")
-    if bias_dn: score_sell += 2; notes.append("bias_down")
+    if bias_up:
+        score_buy += 2; notes.append("bias_up")
+    if bias_dn:
+        score_sell += 2; notes.append("bias_down")
 
     # RSI triggers
-    if rsi5 < 28: score_buy += 3; notes.append("rsi5_oversold")
-    elif rsi5 < 35: score_buy += 1; notes.append("rsi5_low")
-    if rsi5 > 72: score_sell += 3; notes.append("rsi5_overbought")
-    elif rsi5 > 65: score_sell += 1; notes.append("rsi5_high")
+    if rsi5v < 28:
+        score_buy += 3; notes.append("rsi5_oversold")
+    elif rsi5v < 35:
+        score_buy += 1; notes.append("rsi5_low")
+
+    if rsi5v > 72:
+        score_sell += 3; notes.append("rsi5_overbought")
+    elif rsi5v > 65:
+        score_sell += 1; notes.append("rsi5_high")
 
     # MACD momentum
-    if macd15 > 0: score_buy += 2; notes.append("macd15_pos")
-    if macd15 < 0: score_sell += 2; notes.append("macd15_neg")
+    if macd15v > 0:
+        score_buy += 2; notes.append("macd15_pos")
+    if macd15v < 0:
+        score_sell += 2; notes.append("macd15_neg")
 
-    # volatility sanity: avoid insanely low atr (dead market) or extreme spikes
-    atr_pct = atr15 / price if price else 0
+    # volatility sanity
+    atr_pct = (atr15v / price) if price else 0.0
     if atr_pct < 0.0008:
         score_buy -= 1; score_sell -= 1; notes.append("low_vol")
     if atr_pct > 0.01:
         score_buy -= 1; score_sell -= 1; notes.append("very_high_vol")
 
-    # decide
+    levels = {"price": price, "rsi5": rsi5v, "macd15": macd15v, "ema1h50": ema1h50, "atr15": atr15v}
+
     best = max(score_buy, score_sell)
-    if best < 5:
-        return "WAIT", 0.0, "no_high_prob_setup", {"price": price, "rsi5": rsi5, "macd15": macd15, "ema1h50": ema1h50, "atr15": atr15}
+    if best < SCORE_THRESHOLD:
+        return "WAIT", 0.0, "no_high_prob_setup", levels
 
     if score_buy > score_sell:
-        conf = clamp((score_buy / 10.0), 0.0, 1.0)
-        return "BUY", conf, "|".join(notes), {"price": price, "rsi5": rsi5, "macd15": macd15, "ema1h50": ema1h50, "atr15": atr15}
+        base_conf = clamp(score_buy / 10.0, 0.0, 1.0)
+        return "BUY", base_conf, "|".join(notes), levels
     else:
-        conf = clamp((score_sell / 10.0), 0.0, 1.0)
-        return "SELL", conf, "|".join(notes), {"price": price, "rsi5": rsi5, "macd15": macd15, "ema1h50": ema1h50, "atr15": atr15}
+        base_conf = clamp(score_sell / 10.0, 0.0, 1.0)
+        return "SELL", base_conf, "|".join(notes), levels
 
 def position_notional(eq):
-    # simple: allocate a fraction of equity as notional for pnl scaling (paper)
     return max(25.0, eq * RISK_PCT)
+
+def blended_confidence(base_conf, levels, side):
+    """
+    Update #3:
+    - confidence is NOT only rules
+    - if enough trade history exists, blend rule confidence with learned win-prob
+    """
+    n_trades = metrics().get("trades", 0)
+    if n_trades < MODEL_MIN_TRADES:
+        return base_conf, {"mode": "rules_only", "n_trades": n_trades}
+
+    p_win = model_predict_prob(levels, side)
+    # blend: 40% rules + 60% learned (tunable)
+    conf = clamp(0.4 * base_conf + 0.6 * p_win, 0.0, 1.0)
+    return conf, {"mode": "blended", "n_trades": n_trades, "p_win": p_win}
 
 # ================= FASTAPI =================
 STATE = {}
@@ -317,6 +484,15 @@ def metrics_route():
 def calibrate_route():
     return calibrate_min_conf()
 
+@app.get("/model")
+def model_route():
+    return {
+        "ok": True,
+        "w": json.loads(get_state_text("model_w")),
+        "stats": get_model_stats(),
+        "min_trades": MODEL_MIN_TRADES
+    }
+
 @app.get("/trades")
 def trades_route():
     df = load_trades_df()
@@ -324,7 +500,6 @@ def trades_route():
 
 @app.get("/candles")
 def candles_route(tf: str = "15m"):
-    # serves cached candles so UI is fast
     if tf not in CACHE:
         return {"ok": False, "error": "tf must be one of: 5m,15m,1h"}
     df = CACHE[tf]
@@ -338,9 +513,7 @@ def candles_route(tf: str = "15m"):
 def engine_loop():
     init_db()
 
-    open_trade = None  # dict with keys: id, side, entry, sl, tp, opened_ts, conf, reason, notional
-    last_closed_bar_t = None
-
+    open_trade = None  # dict with keys: id, side, entry, sl, tp, opened_ts, conf, reason, notional, levels, model_meta
     while True:
         try:
             df5  = fetch_candles(TF_5M,  limit=min(MAX_BARS, 400))
@@ -352,12 +525,11 @@ def engine_loop():
             CACHE["1h"] = df1h
 
             price = float(df15["c"].iloc[-1])
-            atr15 = float(atr(df15).iloc[-1]) if len(df15) > 20 else 0.0
+            atr15v = float(atr(df15).iloc[-1]) if len(df15) > 20 else 0.0
 
-            signal, conf, reason, levels = score_setup(df5, df15, df1h)
+            signal, base_conf, reason, levels = score_setup(df5, df15, df1h)
             mc = float(min_conf())
 
-            # cooldown based on bar time
             current_bar_t = float(df15["t"].iloc[-1].timestamp())
             cd_until = float(cooldown_until_t())
             in_cooldown = current_bar_t < cd_until
@@ -379,24 +551,23 @@ def engine_loop():
                     elif price <= tp: hit = "TP"
 
                 if hit:
-                    # pnl scaled by notional
                     direction = 1.0 if side == "LONG" else -1.0
                     pnl = (price - entry) * direction * (notional / entry)
 
-                    # R multiple approx: pnl / (risk per unit)
                     risk_per_unit = abs(entry - sl)
-                    r_mult = ( (price-entry)*direction ) / (risk_per_unit if risk_per_unit else 1e-9)
+                    r_mult = (((price - entry) * direction) / (risk_per_unit if risk_per_unit else 1e-9))
 
-                    # persist
                     opened_ts = open_trade["opened_ts"]
                     closed_ts = datetime.now(timezone.utc).timestamp()
                     duration = int(max(0, closed_ts - opened_ts))
+
+                    trade_id = open_trade["id"]
 
                     c = db()
                     c.execute(
                         "INSERT INTO trades VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
-                            open_trade["id"],
+                            trade_id,
                             side,
                             entry,
                             price,
@@ -417,22 +588,33 @@ def engine_loop():
 
                     # cooldown: N bars
                     set_cooldown_until_t(current_bar_t + COOLDOWN_BARS * TF_15M)
-                    open_trade = None
+
+                    # train model (Update #3) on the result
+                    won = pnl > 0
+                    model_train_on_trade(trade_id, won)
 
                     # recalibrate occasionally
                     if metrics().get("trades", 0) % 10 == 0:
                         calibrate_min_conf()
 
-            # open new trade (only if none open)
-            if open_trade is None and signal in ("BUY", "SELL") and not in_cooldown and atr15 > 0:
+                    open_trade = None
+
+            # open new trade
+            if open_trade is None and signal in ("BUY", "SELL") and not in_cooldown and atr15v > 0:
+                side = "LONG" if signal == "BUY" else "SHORT"
+
+                # Update #3: blended confidence (rules + learned probability)
+                conf, model_meta = blended_confidence(base_conf, levels, side)
+
                 if conf >= mc:
-                    side = "LONG" if signal == "BUY" else "SHORT"
-                    sl = price - ATR_SL_MULT * atr15 if side == "LONG" else price + ATR_SL_MULT * atr15
-                    tp = price + ATR_TP_MULT * atr15 if side == "LONG" else price - ATR_TP_MULT * atr15
+                    sl = price - ATR_SL_MULT * atr15v if side == "LONG" else price + ATR_SL_MULT * atr15v
+                    tp = price + ATR_TP_MULT * atr15v if side == "LONG" else price - ATR_TP_MULT * atr15v
                     nt = position_notional(equity())
 
+                    trade_id = str(uuid.uuid4())
+
                     open_trade = {
-                        "id": str(uuid.uuid4()),
+                        "id": trade_id,
                         "side": side,
                         "entry": price,
                         "sl": float(sl),
@@ -441,21 +623,45 @@ def engine_loop():
                         "conf": float(conf),
                         "reason": reason,
                         "notional": float(nt),
+                        "levels": levels,
+                        "model_meta": model_meta,
                     }
 
+                    # save entry features for learning later
+                    f = features_from_levels(levels, side).tolist()
+                    c = db()
+                    c.execute(
+                        "INSERT INTO trade_features(trade_id,f_json) VALUES(?,?) ON CONFLICT(trade_id) DO UPDATE SET f_json=excluded.f_json",
+                        (trade_id, json.dumps([float(x) for x in f]))
+                    )
+                    c.commit(); c.close()
+
             # update API state
+            out_signal = signal if not in_cooldown else "WAIT"
+            out_conf = 0.0 if not in_cooldown else 0.0
+
+            if not in_cooldown and signal in ("BUY", "SELL"):
+                # show blended confidence for UI
+                side_preview = "LONG" if signal == "BUY" else "SHORT"
+                out_conf, meta = blended_confidence(base_conf, levels, side_preview)
+            else:
+                meta = {"mode": "cooldown_or_wait"}
+
             STATE.update({
                 "ok": True,
                 "time": now_iso(),
                 "symbol": SYMBOL,
-                "price": price,
-                "signal": signal if not in_cooldown else "WAIT",
-                "confidence": conf if not in_cooldown else 0.0,
+                "price": float(price),
+                "signal": out_signal,
+                "confidence": float(out_conf) if out_signal in ("BUY","SELL") else float(out_conf),
+                "base_conf": float(base_conf),
                 "min_conf": float(min_conf()),
                 "reason": reason if not in_cooldown else "cooldown",
                 "equity": float(equity()),
                 "open_trade": open_trade,
                 "levels": levels,
+                "model_meta": meta,
+                "score_threshold": SCORE_THRESHOLD,
             })
 
         except Exception as e:
@@ -464,3 +670,9 @@ def engine_loop():
         time.sleep(ENGINE_LOOP_SEC)
 
 threading.Thread(target=engine_loop, daemon=True).start()
+
+# Allow "python btc_engine.py" locally
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
